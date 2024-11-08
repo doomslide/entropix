@@ -170,6 +170,9 @@ class DSConfig:
   dirichlet_threshold: DirichletThreshold
   target_entropy: TargetEntropy
 
+  # Renyi entropy parameters
+  renyi_parameters: jnp.ndarray  # Shape (num_renyi,)
+
   # Token outlier
   outlier_topk: int
 
@@ -276,5 +279,7 @@ DEFAULT_DS_CONFIG = DSConfig(
   target_entropy=TargetEntropy(
     linear=jnp.array([1.0, 1.0, 1.0, 1.0]), linear_inv_temp=jnp.ones(1) * 8.0, bias=0.0
   ),
+  renyi_parameters=jnp.array([0.5, 1.0, 2.0]),  # Example Renyi parameters
   outlier_topk=3,
 )
+
