@@ -1,9 +1,15 @@
+from dataclasses import dataclass
 from functools import partial
-from typing import NamedTuple, Tuple
-from entropix.emwa import EMWA
+from typing import Dict, NamedTuple, Tuple
+
 import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
+
+from entropix.emwa import EMWA
+
+MAX_K = 256
+LN_2 = 0.69314718056  # ln(2) = 1.0 / LOG2_E
 
 from entropix.dslider_config import (
     MIN_TEMP,
@@ -313,18 +319,6 @@ def update_token_cross_entropies(
   )
 
 
-
-from dataclasses import dataclass
-from functools import partial
-from typing import Dict, Tuple
-
-from entropix.dslider import DSState, adaptive_dirichlet_step
-from entropix.dslider_config import DSConfig
-import jax
-import jax.numpy as jnp
-
-MAX_K = 256
-LN_2 = 0.69314718056  # ln(2) = 1.0 / LOG2_E
 
 
 @dataclass
