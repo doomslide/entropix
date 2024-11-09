@@ -99,8 +99,6 @@ def topk_entropies(logits: jax.Array, cat_size: int, renyi_params: jax.Array, no
   # Compute Renyi entropy on truncated distribution
   return renyi_entropy(topk_logprobs, renyi_params)
 
-
-
 # @partial(jax.jit, static_argnames=("config", "dtype"))
 def initialize_state(
   logits: jax.Array, bsz: int, config: DSConfig, dtype=jnp.bfloat16
