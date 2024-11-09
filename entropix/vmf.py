@@ -101,58 +101,65 @@ def initialize_state(n_clusters, d_model, dir_prior=1.0, mean_prior_conc=0.0, se
 
 def e_step(state: ModelState, embeddings: jnp.ndarray, log_prior: jnp.ndarray):
     """
-    Perform the E-step: compute responsibilities.
-    Args:
-        state: ModelState containing current parameters
-        embeddings: shape (batch_size, d_model)
-        log_prior: shape (batch_size,)
-    Returns:
-        resp: shape (batch_size, n_clusters)
+    E-step with shape validation
     """
-    # Compute log mixing proportions
-    log_mix = digamma(state.mix_dir) - digamma(jnp.sum(state.mix_dir))
+    n_samples = embeddings.shape[0]
+    assert state.means.shape[0] == state.conc.shape[0], "Mismatch in number of clusters"
     
-    # Compute log normalizing constants using the saddlepoint approximation
-    log_norm = log_Cp_saddle(state.conc, state.d_model)
+    weighted_means = state.means * state.conc[:, None]
+    log_likelihoods = embeddings @ weighted_means.T
     
-    # Compute weighted means
-    weighted_means = state.means * state.conc[:, None]  # Shape: (n_clusters, d_model)
+    # Add mixing proportions (in log space)
+    mix_props = state.mix_dir / jnp.sum(state.mix_dir)
+    log_mix = jnp.log(mix_props + 1e-10)
     
-    # Compute log probabilities (unnormalized)
-    log_resp = embeddings @ weighted_means.T  # Shape: (batch_size, n_clusters)
-    log_resp += log_mix  # Add log mixing proportions
-    log_resp -= log_norm  # Subtract log normalizing constants
-    log_resp += log_prior[:, None]  # Add log prior if provided
+    log_resp = log_likelihoods + log_mix + log_prior[:, None]
+    log_resp = log_resp - jax.scipy.special.logsumexp(log_resp, axis=1, keepdims=True)
     
-    # Normalize log responsibilities
-    log_resp = log_resp - logsumexp(log_resp, axis=1, keepdims=True)
-    resp = jnp.exp(log_resp)
-    return resp
+    return jnp.exp(log_resp)
+
+def estimate_kappa_high_dim(r_bar, d):
+    """
+    Estimate kappa for high-dimensional vMF using an improved approximation.
+    Based on Banerjee et al. (2005) and Song et al. (2012).
+    """
+    # Clip r_bar to valid range
+    r_bar = jnp.clip(r_bar, 1e-8, 1 - 1e-8)
+    
+    # High-dimensional approximation
+    kappa = r_bar * (d - r_bar**2) / (1 - r_bar**2)
+    
+    # Apply correction factor for high kappa
+    correction = 1 + (d - 1) / (2 * kappa)
+    kappa = kappa * correction
+    
+    # Additional correction for very high dimensions
+    dim_factor = jnp.sqrt(d / 1000)  # Normalize by reference dimension
+    kappa = kappa * dim_factor
+    
+    return kappa
 
 def m_step(state: ModelState, embeddings: jnp.ndarray, resp: jnp.ndarray):
     """
-    Modified M-step with minimum thresholds to prevent collapse.
+    Modified M-step with improved kappa estimation for high dimensions.
     """
-    # Update mixing proportions with minimum threshold
-    Nk = jnp.sum(resp, axis=0)  # Effective number of points in each cluster
-    alpha_post = state.mix_dir + Nk
-    alpha_post = jnp.maximum(alpha_post, 1.0)  # Prevent collapse to zero
+    # Update mixing proportions
+    Nk = jnp.sum(resp, axis=0)
+    alpha_post = state.dir_prior + Nk
     
     # Update means
-    S_k = resp.T @ embeddings  # Sum of weighted points
+    S_k = resp.T @ embeddings
     mu_post = S_k / (jnp.linalg.norm(S_k, axis=1, keepdims=True) + 1e-10)
     
-    # Update concentration parameters with minimum threshold
+    # Compute mean resultant length
     r_bar = jnp.linalg.norm(S_k, axis=1) / (Nk + 1e-10)
     r_bar = jnp.clip(r_bar, 1e-8, 1 - 1e-8)
     
-    # Estimate kappa with minimum threshold
-    kappa_post = estimate_kappa_from_r_bar(r_bar, state.d_model)
-    kappa_post = jnp.maximum(kappa_post, 100.0)  # Prevent collapse to zero
+    # Estimate kappa using improved high-dimensional method
+    kappa_post = jax.vmap(lambda r: estimate_kappa_high_dim(r, state.d_model))(r_bar)
     
-    # Update counts and sums
-    cluster_counts = state.cluster_counts + Nk
-    dir_sums = state.dir_sums + S_k
+    # Apply stability constraints
+    kappa_post = jnp.clip(kappa_post, 100.0, 1e6)
     
     return ModelState(
         n_clusters=state.n_clusters,
@@ -162,8 +169,8 @@ def m_step(state: ModelState, embeddings: jnp.ndarray, resp: jnp.ndarray):
         mix_dir=alpha_post,
         means=mu_post,
         conc=kappa_post,
-        cluster_counts=cluster_counts,
-        dir_sums=dir_sums
+        cluster_counts=state.cluster_counts + Nk,
+        dir_sums=state.dir_sums + S_k
     )
 
 def compute_log_likelihood(state: ModelState, embeddings: jnp.ndarray):
@@ -537,6 +544,26 @@ def train_vmf_mixture(samples, true_labels, state, n_epochs=20, batch_size=1000)
     
     return best_state
 
+def verify_kappa_estimation():
+    """
+    Verify kappa estimation accuracy across different values.
+    """
+    print("\nVerifying kappa estimation:")
+    test_kappas = [5000.0, 10000.0, 15000.0]
+    d_model = 1000
+    
+    for true_kappa in test_kappas:
+        # Compute theoretical r_bar
+        r_bar = 1 - (d_model - 1) / (2 * true_kappa)
+        
+        # Estimate kappa
+        est_kappa = estimate_kappa_high_dim(r_bar, d_model)
+        
+        print(f"\nTrue kappa: {true_kappa:.1f}")
+        print(f"r_bar: {r_bar:.4f}")
+        print(f"Estimated kappa: {est_kappa:.1f}")
+        print(f"Relative error: {abs(est_kappa - true_kappa) / true_kappa:.4f}")
+
 if __name__ == "__main__":
     # Test settings
     d_model = 1000
@@ -552,8 +579,8 @@ if __name__ == "__main__":
     print("\nCenter cosine similarities:")
     print(cos_sims)
     
-    # Use moderate kappas for stability
-    kappas = jnp.array([5000.0, 6000.0, 7000.0])
+    # Use higher kappas
+    kappas = jnp.array([10000.0, 12500.0, 15000.0])
     alphas = jnp.array([0.3, 0.4, 0.3])
     
     # Verify sampling function
@@ -564,6 +591,9 @@ if __name__ == "__main__":
         print(f"Empirical r_bar: {stats['r_bar_empirical']:.4f}")
         print(f"Theoretical r_bar: {stats['r_bar_theoretical']:.4f}")
         print(f"Cosine similarity with true mean: {stats['cos_sim']:.4f}")
+    
+    # Verify kappa estimation before training
+    verify_kappa_estimation()
     
     # Generate mixture samples
     n_samples = samples_per_cluster * n_clusters
