@@ -1,0 +1,28 @@
+[
+  {
+    "n_clusters": 2,
+    "d_model": 7966,
+    "accuracy": 1.0,
+    "mix_prop_error": 0.26398164832596915,
+    "kappa_rel_error": 0.43336352024480207,
+    "mean_cos_sims": [
+      1.0000000000000036,
+      0.9999999999999964
+    ],
+    "true_kappas": [
+      11583.176596280784,
+      17878.968798670736
+    ],
+    "recovered_kappas": [
+      7966.0,
+      7966.0
+    ],
+    "true_alphas": [
+      0.7639816483259692,
+      0.2360183516740309
+    ],
+    "recovered_alphas": [
+      0.5,
+      0.5
+    ],
+    "final_log_likelihood": 
