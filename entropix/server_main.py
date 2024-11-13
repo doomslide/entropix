@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import AsyncGenerator, List, Literal, Optional, Set, Tuple
 
 import jax
+# jax.config.update('jax_disable_jit', True)
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -142,11 +143,13 @@ class ModelManager:
     )
 
     try:
-      async for _ in self._orchestrator.decode(warmup_request):
-        pass
+      logger.info("Starting warmup decode...")
+      async for token_data in self._orchestrator.decode(warmup_request):
+        logger.info(f"Warmup generated token: {token_data}")
       logger.info("Warmup complete")
     except Exception as e:
-      logger.error(f"Warmup failed: {str(e)}")
+      logger.error(f"Warmup failed with error: {str(e)}")
+      logger.exception("Full traceback:")
       raise
 
   async def generate_response(

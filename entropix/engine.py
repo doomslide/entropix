@@ -297,7 +297,47 @@ class EntropixEngine:
       mask = jnp.hstack([jnp.zeros((seqlen, start_pos)), mask], dtype=jnp.float32)
     return mask
 
-  @functools.partial(jax.jit, static_argnames=("self", "params"))
+  @functools.partial(jax.jit, static_argnames=('self',))
+  def _process_logits(self, logits: jax.Array, true_length: int, next_token: jax.Array, bsz: int) -> ResultTokens:
+    """Process logits and create result tokens"""
+    tokens = next_token
+    validity = jnp.ones_like(next_token, dtype=jnp.bool_)
+    lengths = jnp.broadcast_to(
+        jnp.array([[true_length + 1]], dtype=jnp.int32), (tokens.shape[0], 1)
+    )
+    data = jnp.concatenate([tokens, validity, lengths], axis=1)
+    return ResultTokens(
+        data=data,
+        tokens_idx=(0, 1),
+        valid_idx=(1, 2),
+        length_idx=(2, 3),
+        samples_per_slot=bsz,
+    )
+
+  @functools.partial(jax.jit, static_argnames=('self', 'bsz'))
+  def _process_generate_result(self, new_token: jax.Array, generated_tokens: jax.Array, bsz: int) -> ResultTokens:
+    """Process generate results with explicit shape handling"""
+    # Create lengths array with explicit shape
+    lengths = jnp.full((bsz, 1), 1, dtype=jnp.int32) + generated_tokens[:, -1:]
+    
+    # Concatenate arrays with known shapes
+    data = jnp.concatenate(
+        [
+            new_token,  # shape: (bsz, 1)
+            jnp.ones_like(new_token, dtype=jnp.bool_),  # shape: (bsz, 1)
+            lengths,  # shape: (bsz, 1)
+        ],
+        axis=1
+    )
+    
+    return ResultTokens(
+        data=data,
+        tokens_idx=(0, 1),
+        valid_idx=(1, 2),
+        length_idx=(2, 3),
+        samples_per_slot=bsz,
+    )
+
   def prefill(
     self,
     *,
@@ -324,6 +364,7 @@ class EntropixEngine:
     kvcache = KVCache.new(
       params.n_layers, bsz, params.max_seq_len, params.n_local_kv_heads, params.head_dim
     )
+    
     with self.mesh:
       logits, kvcache, _ = self.xfmr_fn(
         self.xfmr_weights,
@@ -337,25 +378,9 @@ class EntropixEngine:
     # next_token = jnp.argmax(logits[:, -1], axis=-1, keepdims=True).astype(jnp.int32)
     _, next_token = jax.lax.top_k(logits[:, true_length], k=top_k)
     next_token = jnp.array(next_token, dtype=jnp.int32).reshape((top_k, 1))
-    # Create arrays for tokens, validity, and lengths
-    tokens = next_token
-    validity = jnp.ones_like(next_token, dtype=jnp.bool_)
-    lengths = jnp.broadcast_to(
-      jnp.array([[true_length + 1]], dtype=jnp.int32), (tokens.shape[0], 1)
-    )
-    data = jnp.concatenate([tokens, validity, lengths], axis=1)
-    result = ResultTokens(
-      data=data,
-      # Tokens are shape [batch, speculations], so when we concatenate
-      # tokens, validity and length along their index 1 dimension then they
-      # occupy 0:speculations.
-      tokens_idx=(0, 1),
-      # Validity occupies the same amount of space, but next in line.
-      valid_idx=(1, 2),
-      # And lengths is rank 1.
-      length_idx=(2, 3),
-      samples_per_slot=bsz,
-    )
+    
+    # Use the jitted helper function
+    result = self._process_logits(logits, true_length, next_token, bsz)
 
     return {
       "logits": logits,
@@ -365,7 +390,7 @@ class EntropixEngine:
       "tokens": next_token,
     }, result
 
-  @functools.partial(jax.jit, static_argnums=(0, 1))
+  # @functools.partial(jax.jit, static_argnums=(0, 1))
   def generate(
     self,
     params: Params,
@@ -391,6 +416,7 @@ class EntropixEngine:
     freqs_cis_slice = jax.lax.dynamic_slice(
       self.freqs_cis, (cur_pos, 0), (1, self.freqs_cis.shape[1])
     )
+    
     with self.mesh:
       logits, kvcache, _ = self.xfmr_fn(
         self.xfmr_weights,
@@ -404,31 +430,15 @@ class EntropixEngine:
     # TODO(xjdr): reduce slop tokens by penalizing slop weights
     # logits = logits.at[:, -1, self.slop_tokens].multiply(self.slop_weights[None, :, None])
     new_token, new_state = self.sample_fn(
-      decode_state["dslider_state"], logits[:, -1, :], DEFAULT_DS_CONFIG, key=rng
+      decode_state["dslider_state"], 
+      logits[:, -1, :], 
+      DEFAULT_DS_CONFIG, 
+      key=rng
     )
     new_token = new_token.reshape((bsz, 1))
 
-    result = ResultTokens(
-      data=jnp.concatenate(
-        (
-          new_token,
-          jnp.ones_like(new_token, dtype=jnp.bool_),
-          jnp.full(
-            (bsz, 1), decode_state["generated_tokens"][:, -1] + 1, dtype=jnp.int32
-          ),
-        ),
-        axis=1,
-      ),
-      # Tokens are shape [batch, speculations], so when we concatenate
-      # tokens, validity and length along their index 1 dimension then they
-      # occupy 0:speculations.
-      tokens_idx=(0, 1),
-      # Validity occupies the same amount of space, but next in line.
-      valid_idx=(1, 2),
-      # And lengths is rank 1.
-      length_idx=(2, 3),
-      samples_per_slot=bsz,
-    )
+    # Use the jitted helper function
+    result = self._process_generate_result(new_token, decode_state["generated_tokens"], bsz)
 
     return {
       "logits": logits,

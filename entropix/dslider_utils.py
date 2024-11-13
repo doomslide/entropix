@@ -7,9 +7,21 @@ import jax.scipy.special as jsp
 
 @jax.jit
 def sample_dirichlet(key: jax.random.PRNGKey, alpha: jnp.ndarray) -> jnp.ndarray:
-  """Sample from a Dirichlet distribution."""
-  gamma_samples = jax.random.gamma(key, alpha, shape=alpha.shape)
-  return gamma_samples / jnp.sum(gamma_samples, axis=-1, keepdims=True)
+    """Sample from a Dirichlet distribution using Gumbel-softmax approximation."""
+    # Convert to float32 for stability
+    alpha = alpha.astype(jnp.float32)
+    
+    # Generate Gumbel noise
+    uniform = jax.random.uniform(key, alpha.shape)
+    gumbel = -jnp.log(-jnp.log(uniform + 1e-20) + 1e-20)
+    
+    # Compute log probabilities
+    logits = jnp.log(alpha + 1e-20) + gumbel
+    
+    # Apply softmax
+    samples = jax.nn.softmax(logits, axis=-1)
+    
+    return samples.astype(alpha.dtype)
 
 
 @jax.jit
@@ -44,7 +56,9 @@ def dirichlet_expectation(alpha: jnp.ndarray) -> jnp.ndarray:
   - αᵢ is the i-th parameter
   - ∑ⱼαⱼ is the sum of all parameters
   """
+  print("DEBUG: Computing Dirichlet expectation")
   alpha_sum = jnp.sum(alpha, axis=-1, keepdims=True)
+  print("DEBUG: Dirichlet expectation computed")
   return alpha / alpha_sum
 
 
