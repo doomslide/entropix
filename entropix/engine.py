@@ -2,6 +2,7 @@ import functools
 import math
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, Union
 
+from entropix.dslider_tuning import OnlineTuner
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -441,6 +442,11 @@ class EntropixEngine:
       DEFAULT_DS_CONFIG, 
       key=rng
     )
+
+    # At the end of your session, print tuning summary
+    print(decode_state["tuner"].get_summary())
+    jax.debug.print("{}", decode_state["tuner"].get_summary())
+
     new_token = new_token.reshape((bsz, 1))
 
     # Use the jitted helper function
