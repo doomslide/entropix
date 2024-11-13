@@ -244,7 +244,9 @@ class EntropixEngine:
   def colocated_cpus(self) -> Union[list[CpuDevices], None]:
     """CPU devices colocated with the engine's accelerators."""
 
-  def apply_scaling(self, freqs: jax.Array):
+  @functools.partial(jax.jit, static_argnames=('self',))
+  def apply_scaling(self, freqs: jax.Array) -> jax.Array:
+    """Apply scaling with explicit constants."""
     SCALE_FACTOR = 8
     LOW_FREQ_FACTOR = 1
     HIGH_FREQ_FACTOR = 4
@@ -273,7 +275,7 @@ class EntropixEngine:
 
     return jax.vmap(scale_freq)(freqs)
 
-  # @functools.partial(jax.jit, static_argnums=(0, 1))
+  @functools.partial(jax.jit, static_argnames=('self', 'dim', 'end', 'theta', 'use_scaled'))
   def precompute_freqs_cis(
     self,
     dim: int,
@@ -282,6 +284,7 @@ class EntropixEngine:
     use_scaled: bool = False,
     dtype: jnp.dtype = jnp.float32,
   ) -> jax.Array:
+    """Precompute frequency cis with explicit static arguments."""
     freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
     if use_scaled:
       freqs = self.apply_scaling(freqs)
@@ -290,11 +293,14 @@ class EntropixEngine:
     return jnp.exp(1j * freqs)
 
   def build_attn_mask(self, seqlen: int, start_pos: int) -> jax.Array:
+    """Build attention mask without jit for now."""
     mask = jnp.zeros((seqlen, seqlen), dtype=jnp.float32)
     if seqlen > 1:
       mask = jnp.full((seqlen, seqlen), float("-inf"))
       mask = jnp.triu(mask, k=1)
-      mask = jnp.hstack([jnp.zeros((seqlen, start_pos)), mask], dtype=jnp.float32)
+      # Use dynamic_slice_in_dim for handling dynamic start_pos
+      prefix = jnp.zeros((seqlen, start_pos), dtype=jnp.float32)
+      mask = jnp.concatenate([prefix, mask], axis=1)
     return mask
 
   @functools.partial(jax.jit, static_argnames=('self',))
