@@ -98,7 +98,7 @@ def initialize_state(
   return state
 
 
-@partial(jax.jit, static_argnames=("config", "tuner", "wild"))
+@partial(jax.jit, static_argnames=("wild",))
 def adaptive_dirichlet_step(
   key: jax.random.PRNGKey,
   state: DSState,
@@ -106,14 +106,22 @@ def adaptive_dirichlet_step(
   config: DSConfig,
   tuner: Optional[OnlineTuner] = None,
   wild: bool = True,
-) -> Tuple[DSState, jnp.ndarray]:
+) -> Tuple[DSState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+  print("\nDirichlet Step Debug - Start")
   dtype = logits.dtype
   bsz, vsz = logits.shape
+  print(f"Input shapes - bsz: {bsz}, vsz: {vsz}")
+
   output_tokens = jnp.zeros(bsz, dtype=jnp.int32)
   EPS = jnp.array(1e-8, dtype=dtype)
   naked_log_probs = normalize_logits(logits, config.noise_floor)
+  print("Normalized logits")
+
   # update naked entropy rate
   naked_ent, naked_varent = ent_varent(naked_log_probs)
+  print(f"Naked entropy: {naked_ent}")
+  print(f"Naked varentropy: {naked_varent}")
+
   # fix shape issue!
   new_emwa_ent_naked = update_emwa(
     naked_ent, state.emwa_ent_naked, config.emwa_ent_naked_coeff
@@ -121,6 +129,8 @@ def adaptive_dirichlet_step(
   new_emwa_varent_naked = update_emwa(
     naked_varent, state.emwa_varent_naked, config.emwa_varent_naked_coeff
   )
+  print("Updated EMWA values")
+
   # entropy and varentropy vectors - shape (bsz, 4)
   state_ent = jnp.array(
     [
@@ -129,7 +139,7 @@ def adaptive_dirichlet_step(
       state.emwa_ent_scaffold,
       state.emwa_ent_naked,
     ]
-  ).T  # TODO(doomslide): add dirichlet expected entropy...
+  ).T
   state_std = jnp.sqrt(
     jnp.array(
       [
@@ -139,7 +149,9 @@ def adaptive_dirichlet_step(
         state.emwa_varent_naked,
       ]
     )
-  ).T  # TODO(doomslide): add dirichlet expected std...
+  ).T
+  print("Computed state vectors")
+
   outlier_threshold = compute_outlier_threshold(
     state_ent, state_std, naked_ent, naked_varent, config
   )
@@ -227,9 +239,7 @@ def adaptive_dirichlet_step(
   below dirichlet threshold, interpolate and sample (can improve this in the future)
   """
   kl = jnp.sum(dir_probs * (jnp.log(dir_probs + EPS) - logprobs_on_supp), axis=-1)
-  perturb_coeff = 1 - jnp.pow(
-    config.perturb_base_coeff, -config.perturb_exp_coeff * (1 / (kl + EPS))
-  )
+  perturb_coeff = config.perturb_base_coeff / (1 + jnp.exp(config.perturb_exp_coeff * kl))
   interpolated_probs = perturb_coeff[:, None] * dir_probs + (
     1 - perturb_coeff[:, None]
   ) * jnp.exp(logprobs_on_supp)
@@ -253,10 +263,22 @@ def adaptive_dirichlet_step(
   )
   # update token cross entropies
   batch_indices = jnp.arange(bsz)
-  scaffold_token_logprob = jnp.log(
-    interpolated_probs[batch_indices, output_tokens] + EPS
+  scaffold_token_logprob = jnp.nan_to_num(
+    jnp.log(interpolated_probs[batch_indices, output_tokens] + EPS),
+    nan=0.0, posinf=1e6, neginf=-1e6
   )
-  naked_token_logprob = jnp.log(naked_log_probs[batch_indices, output_tokens] + EPS)
+  naked_token_logprob = jnp.nan_to_num(
+    naked_log_probs[batch_indices, output_tokens],
+    nan=0.0, posinf=1e6, neginf=-1e6
+  )
+
+  # Add debug prints to track values
+  print("\nToken logprob debug:")
+  print(f"Scaffold token logprob: {scaffold_token_logprob}")
+  print(f"Naked token logprob: {naked_token_logprob}")
+  print(f"Interpolated probs: {interpolated_probs[batch_indices, output_tokens]}")
+  print(f"Naked logprobs: {naked_log_probs[batch_indices, output_tokens]}")
+
   (
     new_token_cross_ent_scaffold,
     new_token_cross_ent_naked,
@@ -266,12 +288,15 @@ def adaptive_dirichlet_step(
     state, scaffold_token_logprob, naked_token_logprob, config
   )
   if tuner:
-    config = tuner.update(
+    new_config, new_tuner = tuner.pure_update(
         jnp.log(interpolated_probs + EPS),
         naked_log_probs,
         new_token_cross_ent_naked,
         new_token_cross_ent_scaffold
     )
+    config = new_config
+    tuner = new_tuner
+
   # assemble new state
   new_state = DSState(
     emwa_dir=new_emwa_dir,
@@ -289,20 +314,37 @@ def adaptive_dirichlet_step(
     emwa_topk_ent_naked=new_emwa_topk_ent_naked,
   )
 
-  if tuner:
-    tuner.idx += 1
-    if tuner.idx < tuner.max_idx:
-      return adaptive_dirichlet_step(key, new_state, logits, config, tuner, wild)
+  # Add debug prints
+  jax.debug.print("Outlier mask: {}", outlier_mask)
+  jax.debug.print("Dirichlet threshold: {}", dirichlet_threshold)
+  jax.debug.print("Use dirichlet: {}", use_dirichlet)
+  jax.debug.print("Perturb coeff: {}", perturb_coeff)
+  jax.debug.print("KL: {}", kl)
+  jax.debug.print("Dir probs entropy: {}", -jnp.sum(dir_probs * jnp.log(dir_probs + EPS), axis=-1))
+  jax.debug.print("Logprobs entropy: {}", -jnp.sum(jnp.exp(logprobs_on_supp) * logprobs_on_supp, axis=-1))
+  jax.debug.print("Output tokens: {}", output_tokens)
 
+  # Add randomness to break out of loops
+  if wild:
+    noise = jax.random.uniform(key, perturb_coeff.shape, minval=0.8, maxval=1.2)
+    perturb_coeff = perturb_coeff * noise
+    
+    # Add noise to dirichlet threshold
+    noise = jax.random.uniform(key, dirichlet_threshold.shape, minval=0.9, maxval=1.1)
+    dirichlet_threshold = dirichlet_threshold * noise
+
+  print("\nDirichlet Step Debug - End")
+
+  # Return all the values needed for tuning
   return (
-    new_state,
+    new_state, 
     output_tokens,
-    naked_ent,
-    naked_varent,
-    scaffold_ent,
-    scaffold_varent,
-    naked_token_logprob,
-    scaffold_token_logprob,
+    naked_token_logprob,      # For cross entropy
+    scaffold_token_logprob,   # For cross entropy
+    jnp.log(interpolated_probs + EPS),  # scaffold logprobs
+    naked_log_probs,          # naked logprobs
+    new_token_cross_ent_naked,
+    new_token_cross_ent_scaffold
   )
 
 

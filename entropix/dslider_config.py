@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -12,24 +13,26 @@ EPS = 1e-8
 VOCAB_SIZE = 128256
 
 
-@dataclass(frozen=True)
+@register_pytree_node_class
 class OutlierThreshold:
-  bilinear: jnp.ndarray  # Shape (4, 4)
-  linear_state_ent: jnp.ndarray  # Shape (4,)
-  linear_state_std: jnp.ndarray  # Shape (4,)
-  linear_naked_ent: float
-  linear_naked_std: float
-  linear_naked_varent: float
-  bias: float
+  def __init__(self, bilinear, linear_state_ent, linear_state_std, 
+               linear_naked_ent, linear_naked_std, linear_naked_varent, bias):
+    self.bilinear = bilinear
+    self.linear_state_ent = linear_state_ent
+    self.linear_state_std = linear_state_std
+    self.linear_naked_ent = linear_naked_ent
+    self.linear_naked_std = linear_naked_std
+    self.linear_naked_varent = linear_naked_varent
+    self.bias = bias
 
   def tree_flatten(self):
     """For JAX pytree handling"""
-    arrays = [self.bilinear, self.linear_state_ent, self.linear_state_std]
+    arrays = (self.bilinear, self.linear_state_ent, self.linear_state_std)
     aux_data = {
-      "linear_naked_ent": self.linear_naked_ent,
-      "linear_naked_std": self.linear_naked_std,
-      "linear_naked_varent": self.linear_naked_varent,
-      "bias": self.bias,
+      'linear_naked_ent': self.linear_naked_ent,
+      'linear_naked_std': self.linear_naked_std,
+      'linear_naked_varent': self.linear_naked_varent,
+      'bias': self.bias
     }
     return arrays, aux_data
 
@@ -40,210 +43,137 @@ class OutlierThreshold:
       bilinear=arrays[0],
       linear_state_ent=arrays[1],
       linear_state_std=arrays[2],
-      **aux_data,
-    )
-
-  def __hash__(self):
-    """Static hash implementation"""
-    return hash(
-      (
-        "OutlierThreshold",
-        self.bilinear.shape,
-        str(self.bilinear.dtype),
-        self.linear_state_ent.shape,
-        str(self.linear_state_ent.dtype),
-        self.linear_state_std.shape,
-        str(self.linear_state_std.dtype),
-        self.linear_naked_ent,
-        self.linear_naked_std,
-        self.linear_naked_varent,
-        self.bias,
-      )
+      linear_naked_ent=aux_data['linear_naked_ent'],
+      linear_naked_std=aux_data['linear_naked_std'],
+      linear_naked_varent=aux_data['linear_naked_varent'],
+      bias=aux_data['bias']
     )
 
 
-@dataclass(frozen=True)
+@register_pytree_node_class
 class ArgmaxThreshold:
-  weight: float
-  bias: float
+  def __init__(self, weight, bias):
+    self.weight = weight
+    self.bias = bias
 
   def tree_flatten(self):
     """For JAX pytree handling"""
-    aux_data = {"weight": self.weight, "bias": self.bias}
-    return [], aux_data
+    return (self.weight, self.bias), {}
 
   @classmethod
   def tree_unflatten(cls, aux_data, arrays):
     """For JAX pytree handling"""
-    return cls(**aux_data)
-
-  def __hash__(self):
-    return hash((self.weight, self.bias))
+    return cls(weight=arrays[0], bias=arrays[1])
 
 
-@dataclass(frozen=True)
+@register_pytree_node_class
 class DirichletThreshold:
-  weight: float
-  bias: float
+  def __init__(self, weight, bias):
+    self.weight = weight
+    self.bias = bias
 
   def tree_flatten(self):
     """For JAX pytree handling"""
-    aux_data = {"weight": self.weight, "bias": self.bias}
-    return [], aux_data
+    return (self.weight, self.bias), {}
 
   @classmethod
   def tree_unflatten(cls, aux_data, arrays):
     """For JAX pytree handling"""
-    return cls(**aux_data)
-
-  def __hash__(self):
-    return hash((self.weight, self.bias))
+    return cls(weight=arrays[0], bias=arrays[1])
 
 
-@dataclass(frozen=True)
+@register_pytree_node_class
 class TargetEntropy:
-  linear: jnp.ndarray  # Shape (4,)
-  linear_inv_temp: jnp.ndarray  # Shape (batch_size,)
-  bias: float
+  def __init__(self, linear, linear_inv_temp, bias):
+    self.linear = linear
+    self.linear_inv_temp = linear_inv_temp
+    self.bias = bias
 
   def tree_flatten(self):
-    arrays = [self.linear, self.linear_inv_temp]
-    aux_data = {"bias": self.bias}
-    return arrays, aux_data
+    """For JAX pytree handling"""
+    return (self.linear, self.linear_inv_temp), {'bias': self.bias}
 
   @classmethod
   def tree_unflatten(cls, aux_data, arrays):
-    return cls(linear=arrays[0], linear_inv_temp=arrays[1], bias=aux_data["bias"])
-
-  def __hash__(self):
-    """Static hash implementation"""
-    return hash(
-      (
-        "TargetEntropy",
-        self.linear.shape,
-        str(self.linear.dtype),
-        self.linear_inv_temp.shape,
-        str(self.linear_inv_temp.dtype),
-        self.bias,
-      )
-    )
+    """For JAX pytree handling"""
+    return cls(linear=arrays[0], linear_inv_temp=arrays[1], bias=aux_data['bias'])
 
 
-@dataclass(frozen=True, eq=True)
+@register_pytree_node_class
 class DSConfig:
-  # EMWA coefficients
-  emwa_logp_base: float
-  emwa_logp_exp_factor: float
-  emwa_dir_coeff: float
-  emwa_temp_coeff: float
-  emwa_dir_ent_coeff: float
-  emwa_ent_scaffold_coeff: float
-  emwa_varent_scaffold_coeff: float
-  emwa_ent_naked_coeff: float
-  emwa_varent_naked_coeff: float
-  emwa_topk_ent_naked_coeff: float
-
-  # Token cross entropy coefficients
-  token_cross_ent_scaffold_coeff: float
-  token_cross_ent_naked_coeff: float
-  token_cross_var_scaffold_coeff: float
-  token_cross_var_naked_coeff: float
-
-  # Dirichlet parameters
-  perturb_base_coeff: float
-  perturb_exp_coeff: float
-  """
-  dirichlet_support is a subset of the vocabulary of your model.
-  recommended tuning:
-  1. sample autoregressively conditioned on random hidden state prompts
-  2. take the empirical average of logprobs across position and prompts
-  3. the support is all logprobs lying above the noise threshold (see normalize_logits in dslider.py)
-  """
-  dirichlet_support: jnp.ndarray
-
-  # noise floor for logits normalization
-  noise_floor: float
-
-  # Threshold parameters
-  outlier_threshold: OutlierThreshold
-  argmax_threshold: ArgmaxThreshold
-  dirichlet_threshold: DirichletThreshold
-  target_entropy: TargetEntropy
-
-  # Token outlier
-  outlier_topk: int
-
-  def __hash__(self):
-    """Static hash implementation that avoids hashing array values"""
-    hashable_items = []
-    for field in self.__dataclass_fields__.values():
-      value = getattr(self, field.name)
-      if isinstance(value, (jnp.ndarray, jax.Array)):
-        hashable_items.append(hash((str(field.name), value.shape, str(value.dtype))))
-      elif isinstance(
-        value, (OutlierThreshold, ArgmaxThreshold, DirichletThreshold, TargetEntropy)
-      ):
-        hashable_items.append(hash(value))
-      else:
-        hashable_items.append(hash((str(field.name), value)))
-    return hash(tuple(hashable_items))
+  def __init__(self, emwa_logp_base, emwa_logp_exp_factor, emwa_dir_coeff, 
+               emwa_temp_coeff, emwa_dir_ent_coeff, emwa_ent_scaffold_coeff,
+               emwa_varent_scaffold_coeff, emwa_ent_naked_coeff, emwa_varent_naked_coeff,
+               emwa_topk_ent_naked_coeff, token_cross_ent_scaffold_coeff,
+               token_cross_ent_naked_coeff, token_cross_var_scaffold_coeff,
+               token_cross_var_naked_coeff, perturb_base_coeff, perturb_exp_coeff,
+               dirichlet_support, noise_floor, outlier_threshold, argmax_threshold,
+               dirichlet_threshold, target_entropy, outlier_topk):
+    self.emwa_logp_base = emwa_logp_base
+    self.emwa_logp_exp_factor = emwa_logp_exp_factor
+    self.emwa_dir_coeff = emwa_dir_coeff
+    self.emwa_temp_coeff = emwa_temp_coeff
+    self.emwa_dir_ent_coeff = emwa_dir_ent_coeff
+    self.emwa_ent_scaffold_coeff = emwa_ent_scaffold_coeff
+    self.emwa_varent_scaffold_coeff = emwa_varent_scaffold_coeff
+    self.emwa_ent_naked_coeff = emwa_ent_naked_coeff
+    self.emwa_varent_naked_coeff = emwa_varent_naked_coeff
+    self.emwa_topk_ent_naked_coeff = emwa_topk_ent_naked_coeff
+    self.token_cross_ent_scaffold_coeff = token_cross_ent_scaffold_coeff
+    self.token_cross_ent_naked_coeff = token_cross_ent_naked_coeff
+    self.token_cross_var_scaffold_coeff = token_cross_var_scaffold_coeff
+    self.token_cross_var_naked_coeff = token_cross_var_naked_coeff
+    self.perturb_base_coeff = perturb_base_coeff
+    self.perturb_exp_coeff = perturb_exp_coeff
+    self.dirichlet_support = dirichlet_support
+    self.noise_floor = noise_floor
+    self.outlier_threshold = outlier_threshold
+    self.argmax_threshold = argmax_threshold
+    self.dirichlet_threshold = dirichlet_threshold
+    self.target_entropy = target_entropy
+    self.outlier_topk = outlier_topk
 
   def tree_flatten(self):
     """Improved flattening for JAX pytree"""
-    arrays = []
-    aux_data = {}
-
-    for field in self.__dataclass_fields__.values():
-      value = getattr(self, field.name)
-      if isinstance(value, (jnp.ndarray, jax.Array)):
-        arrays.append(value)
-      elif isinstance(
-        value, (OutlierThreshold, ArgmaxThreshold, DirichletThreshold, TargetEntropy)
-      ):
-        nested_arrays, nested_aux = value.tree_flatten()
-        arrays.extend(nested_arrays)
-        aux_data[field.name] = (type(value), nested_aux)
-      else:
-        aux_data[field.name] = value
-
+    arrays = (
+      self.outlier_threshold,
+      self.dirichlet_threshold,
+      self.target_entropy
+    )
+    aux_data = {
+      'emwa_logp_base': self.emwa_logp_base,
+      'emwa_logp_exp_factor': self.emwa_logp_exp_factor,
+      'emwa_dir_coeff': self.emwa_dir_coeff,
+      'emwa_temp_coeff': self.emwa_temp_coeff,
+      'emwa_dir_ent_coeff': self.emwa_dir_ent_coeff,
+      'emwa_ent_scaffold_coeff': self.emwa_ent_scaffold_coeff,
+      'emwa_varent_scaffold_coeff': self.emwa_varent_scaffold_coeff,
+      'emwa_ent_naked_coeff': self.emwa_ent_naked_coeff,
+      'emwa_varent_naked_coeff': self.emwa_varent_naked_coeff,
+      'emwa_topk_ent_naked_coeff': self.emwa_topk_ent_naked_coeff,
+      'token_cross_ent_scaffold_coeff': self.token_cross_ent_scaffold_coeff,
+      'token_cross_ent_naked_coeff': self.token_cross_ent_naked_coeff,
+      'token_cross_var_scaffold_coeff': self.token_cross_var_scaffold_coeff,
+      'token_cross_var_naked_coeff': self.token_cross_var_naked_coeff,
+      'perturb_base_coeff': self.perturb_base_coeff,
+      'perturb_exp_coeff': self.perturb_exp_coeff,
+      'dirichlet_support': self.dirichlet_support,
+      'noise_floor': self.noise_floor,
+      'argmax_threshold': self.argmax_threshold,
+      'outlier_topk': self.outlier_topk
+    }
     return arrays, aux_data
 
   @classmethod
   def tree_unflatten(cls, aux_data, arrays):
     """Improved unflattening for JAX pytree"""
-    array_idx = 0
-    field_values = {}
+    return cls(
+      outlier_threshold=arrays[0],
+      dirichlet_threshold=arrays[1],
+      target_entropy=arrays[2],
+      **aux_data
+    )
 
-    for field_name, field in cls.__dataclass_fields__.items():
-      if field_name in aux_data:
-        value = aux_data[field_name]
-        if isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], type):
-          # Reconstruct nested dataclass
-          klass, nested_aux = value
-          if klass in (OutlierThreshold, TargetEntropy):
-            n_arrays = 3 if klass == OutlierThreshold else 2
-            nested_arrays = arrays[array_idx : array_idx + n_arrays]
-            array_idx += n_arrays
-            field_values[field_name] = klass.tree_unflatten(nested_aux, nested_arrays)
-          else:
-            # For ArgmaxThreshold and DirichletThreshold which have no arrays
-            field_values[field_name] = klass(**nested_aux)
-        else:
-          field_values[field_name] = value
-      else:
-        field_values[field_name] = arrays[array_idx]
-        array_idx += 1
-
-    return cls(**field_values)
-
-
-register_pytree_node_class(DSConfig)
-register_pytree_node_class(OutlierThreshold)
-register_pytree_node_class(ArgmaxThreshold)
-register_pytree_node_class(DirichletThreshold)
-register_pytree_node_class(TargetEntropy)
-
-# the outlier threshold, the params for the dirichlet update and the params for the perturbation coefficient
 
 DEFAULT_DS_CONFIG = DSConfig(
   emwa_logp_base=4.0,
@@ -260,8 +190,8 @@ DEFAULT_DS_CONFIG = DSConfig(
   token_cross_ent_naked_coeff=0.65,
   token_cross_var_scaffold_coeff=0.75,
   token_cross_var_naked_coeff=0.65,
-  perturb_base_coeff=10.0,
-  perturb_exp_coeff=1.0,
+  perturb_base_coeff=1,
+  perturb_exp_coeff=1,
   dirichlet_support=jnp.arange(VOCAB_SIZE, dtype=jnp.int32),
   noise_floor=-12.0,
   outlier_threshold=OutlierThreshold(

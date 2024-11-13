@@ -397,69 +397,85 @@ class EntropixEngine:
       "tokens": next_token,
     }, result
 
-  # @functools.partial(jax.jit, static_argnums=(0, 1))
   def generate(
     self,
     params: Params,
     decode_state: DecodeState,
-    sampler: Optional[Callable[[Any], Any]] = None,  # pylint: disable=unused-argument
+    sampler: Optional[Callable[[Any], Any]] = None,
     rng: Optional[jax.random.PRNGKey] = jax.random.PRNGKey(1337),
   ) -> Tuple[DecodeState, ResultTokens]:
-    """Generates tokens for each sequence being decoded in parallel.
+    """Generate tokens with tuner updates"""
+    try:
+        jax.debug.print("Engine Debug - Generate Start")
+        cur_pos = decode_state["next_pos"]
+        bsz = decode_state["tokens"].shape[0]
+        freqs_cis_slice = jax.lax.dynamic_slice(
+            self.freqs_cis, (cur_pos, 0), (1, self.freqs_cis.shape[1])
+        )
+        
+        jax.debug.print("Current position: {}", cur_pos)
+        jax.debug.print("Batch size: {}", bsz)
+        
+        with self.mesh:
+            logits, kvcache, _ = self.xfmr_fn(
+                self.xfmr_weights,
+                params,
+                decode_state["tokens"],
+                cur_pos,
+                freqs_cis_slice,
+                decode_state["cache"],
+            )
 
-    Generate takes a batch of pre-computed kv-caches, and computes:
-      - the predicted next token for each of the sequences
-      - an updated set of kv-caches
+        tuner = decode_state.get("tuner")
+        current_config = tuner.config if tuner else DEFAULT_DS_CONFIG
 
-    In the case of pipelining, this will handle N cycles (where each cycle
-    consists of each microbatch progressing through every stage), in
-    non-pipelined code this is a full forward pass. In both cases, this accounts
-    for a full embed-layerstack-unembed-sample operation.
+        jax.debug.print("Has tuner: {}", tuner is not None)
+        jax.debug.print("Current perturb base: {}", current_config.perturb_base_coeff)
+        
+        # Sample with current config
+        result = self.sample_fn(
+            decode_state["dslider_state"], 
+            logits[:, -1, :], 
+            current_config,
+            key=rng
+        )
+        
+        new_state, new_token, naked_logprob, scaffold_logprob, \
+        scaffold_logprobs, naked_logprobs, cross_ent_naked, \
+        cross_ent_scaffold = result
 
-    If sampler is passed, then the engine should use it do sample next token.
-    """
-    cur_pos = decode_state["next_pos"]
-    bsz = decode_state["tokens"].shape[0]
-    freqs_cis_slice = jax.lax.dynamic_slice(
-      self.freqs_cis, (cur_pos, 0), (1, self.freqs_cis.shape[1])
-    )
-    
-    with self.mesh:
-      logits, kvcache, _ = self.xfmr_fn(
-        self.xfmr_weights,
-        params,
-        decode_state["tokens"],
-        cur_pos,
-        freqs_cis_slice,
-        decode_state["cache"],
-      )
+        jax.debug.print("New token: {}", new_token)
+        jax.debug.print("Cross entropy diff: {}", cross_ent_naked - cross_ent_scaffold)
 
-    # TODO(xjdr): reduce slop tokens by penalizing slop weights
-    # logits = logits.at[:, -1, self.slop_tokens].multiply(self.slop_weights[None, :, None])
-    new_token, new_state = self.sample_fn(
-      decode_state["dslider_state"], 
-      logits[:, -1, :], 
-      DEFAULT_DS_CONFIG, 
-      key=rng
-    )
+        # Update tuner outside jitted code
+        if tuner is not None:
+            config = tuner.update(
+                scaffold_logprobs,
+                naked_logprobs,
+                cross_ent_naked,
+                cross_ent_scaffold
+            )
+            tuner.config = config
 
-    # At the end of your session, print tuning summary
-    print(decode_state["tuner"].get_summary())
-    jax.debug.print("{}", decode_state["tuner"].get_summary())
+        new_token = new_token.reshape((bsz, 1))
+        result = self._process_generate_result(new_token, decode_state["generated_tokens"], bsz)
 
-    new_token = new_token.reshape((bsz, 1))
+        jax.debug.print("Next position: {}", decode_state["next_pos"] + 1)
+        jax.debug.print("Generated tokens: {}", decode_state["generated_tokens"] + 1)
 
-    # Use the jitted helper function
-    result = self._process_generate_result(new_token, decode_state["generated_tokens"], bsz)
+        return {
+            "logits": logits,
+            "cache": kvcache,
+            "next_pos": decode_state["next_pos"] + 1,
+            "generated_tokens": decode_state["generated_tokens"] + 1,
+            "tokens": new_token,
+            "dslider_state": new_state,
+            "tuner": tuner
+        }, result
 
-    return {
-      "logits": logits,
-      "cache": kvcache,
-      "next_pos": decode_state["next_pos"] + 1,
-      "generated_tokens": decode_state["generated_tokens"] + 1,
-      "tokens": new_token,
-      "dslider_state": new_state,
-    }, result
+    except Exception as e:
+        jax.debug.print("Engine Error: {}", str(e))
+        raise
 
   @functools.partial(
     jax.jit,
@@ -497,6 +513,15 @@ class EntropixEngine:
     )
     new_cache = KVCache(k=new_k, v=new_v)
 
+    # Initialize the tuner with better parameters
+    tuner = OnlineTuner(
+        config=DEFAULT_DS_CONFIG,
+        R=2.0,              
+        learning_rate=0.5,  # Increased from 0.1
+        momentum=0.95,      # Increased from 0.9
+        window_size=100
+    )
+
     return {
       "logits": prefix["logits"],
       "cache": new_cache,
@@ -504,4 +529,5 @@ class EntropixEngine:
       "generated_tokens": prefix["generated_tokens"],
       "tokens": prefix["tokens"],
       "dslider_state": initialize_state(prefix["logits"], bsz, DEFAULT_DS_CONFIG),
+      "tuner": tuner  
     }
