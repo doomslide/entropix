@@ -1,15 +1,16 @@
 import functools
 import math
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, Union
+from dataclasses import dataclass
 
-from entropix.dslider_tuning import OnlineTuner
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import PartitionSpec as PS
 
 from entropix.config import ModelParams
-from entropix.dslider import initialize_state
+from entropix.dslider import initialize_state, apply_dry_penalty
+from entropix.dslider_tuning import OnlineTuner
 from entropix.dslider_config import DEFAULT_DS_CONFIG
 from entropix.kvcache import KVCache
 from entropix.tokenizer import Tokenizer
@@ -19,6 +20,16 @@ from entropix.tokenizer import Tokenizer
 These functions are the accelerator functions which an outer sampling loop
 could want to call, enabling interleaved (continuous batching) inference.
 """
+@dataclass
+class SamplingParams:
+  """Parameters for controlling sampling behavior"""
+  temperature: float = 1.0
+  top_k: int = 40
+  top_p: float = 0.9
+  dry_multiplier: float = 2.0
+  dry_base: float = 1.75
+  dry_allowed_length: int = 2
+  dry_window: int = 512
 
 # The model parameters - their partitioning will be unique for different prefill
 # and decode topoologies.
@@ -166,6 +177,7 @@ class EntropixEngine:
     tokenizer: Tokenizer,
     xfmr_fn: Callable,
     sample_fn: Callable,
+    sampling_params: Optional[SamplingParams] = None,
   ):
     """Initialize engine with model parameters and functions.
 
@@ -176,6 +188,7 @@ class EntropixEngine:
         tokenizer: Tokenizer instance
         xfmr_fn: Transformer forward function
         sample_fn: Token sampling function
+        sampling_params: Optional sampling parameters
     """
     self.params = params
     self.xfmr_weights = xfmr_weights
@@ -190,6 +203,15 @@ class EntropixEngine:
     )
     self.xfmr_fn = xfmr_fn
     self.sample_fn = sample_fn
+    self.sampling_params = sampling_params or SamplingParams(
+        temperature=1.0,
+        top_k=40,
+        top_p=0.9,
+        dry_multiplier=2.0,  # Moderate repetition penalty
+        dry_base=1.75,       # Standard growth rate
+        dry_allowed_length=2, # Allow pairs of tokens
+        dry_window=512       # Look back window
+    )
 
   def get_prefix_destination_sharding(self) -> Any:
     """Returns the shardings necessary to transfer data between engines."""
@@ -324,15 +346,18 @@ class EntropixEngine:
   @functools.partial(jax.jit, static_argnames=('self', 'bsz'))
   def _process_generate_result(self, new_token: jax.Array, generated_tokens: jax.Array, bsz: int) -> ResultTokens:
     """Process generate results with explicit shape handling"""
-    # Create lengths array with explicit shape
+    # Ensure new_token has shape (bsz, 1)
+    new_token = new_token.reshape((bsz, 1))
+    
+    # Create lengths array with shape (bsz, 1)
     lengths = jnp.full((bsz, 1), 1, dtype=jnp.int32) + generated_tokens[:, -1:]
     
     # Concatenate arrays with known shapes
     data = jnp.concatenate(
         [
-            new_token,  # shape: (bsz, 1)
-            jnp.ones_like(new_token, dtype=jnp.bool_),  # shape: (bsz, 1)
-            lengths,  # shape: (bsz, 1)
+            new_token,                                # shape: (bsz, 1)
+            jnp.ones_like(new_token, dtype=jnp.bool_), # shape: (bsz, 1)
+            lengths,                                  # shape: (bsz, 1)
         ],
         axis=1
     )
@@ -397,85 +422,86 @@ class EntropixEngine:
       "tokens": next_token,
     }, result
 
+
+
   def generate(
     self,
     params: Params,
     decode_state: DecodeState,
     sampler: Optional[Callable[[Any], Any]] = None,
+    sampling_params: Optional[SamplingParams] = None,
     rng: Optional[jax.random.PRNGKey] = jax.random.PRNGKey(1337),
   ) -> Tuple[DecodeState, ResultTokens]:
-    """Generate tokens with tuner updates"""
-    try:
-        jax.debug.print("Engine Debug - Generate Start")
-        cur_pos = decode_state["next_pos"]
-        bsz = decode_state["tokens"].shape[0]
-        freqs_cis_slice = jax.lax.dynamic_slice(
-            self.freqs_cis, (cur_pos, 0), (1, self.freqs_cis.shape[1])
+    """Generate tokens with tuner updates and DRY penalty."""
+    # Use instance sampling params if none provided
+    sampling_params = sampling_params or self.sampling_params
+    
+    cur_pos = decode_state["next_pos"]
+    bsz = decode_state["tokens"].shape[0]
+    freqs_cis_slice = jax.lax.dynamic_slice(
+        self.freqs_cis, (cur_pos, 0), (1, self.freqs_cis.shape[1])
+    )
+
+    # Add missing dimension to tokens for attention
+    tokens = decode_state["tokens"]
+    if tokens.ndim == 1:
+        tokens = tokens.reshape((bsz, 1))  # Add sequence length dimension
+
+    with self.mesh:
+        logits, kvcache, _ = self.xfmr_fn(
+            self.xfmr_weights,
+            params,
+            tokens,  # Use reshaped tokens
+            cur_pos,
+            freqs_cis_slice,
+            decode_state["cache"],
         )
-        
-        jax.debug.print("Current position: {}", cur_pos)
-        jax.debug.print("Batch size: {}", bsz)
-        
-        with self.mesh:
-            logits, kvcache, _ = self.xfmr_fn(
-                self.xfmr_weights,
-                params,
-                decode_state["tokens"],
-                cur_pos,
-                freqs_cis_slice,
-                decode_state["cache"],
-            )
 
-        tuner = decode_state.get("tuner")
-        current_config = tuner.config if tuner else DEFAULT_DS_CONFIG
+    # Apply DRY penalty before sampling
+    logits = apply_dry_penalty(
+        logits[:, -1, :],  # Take last position only
+        decode_state["tokens"],
+        multiplier=sampling_params.dry_multiplier,
+        base=sampling_params.dry_base,
+        allowed_length=sampling_params.dry_allowed_length,
+        window_size=sampling_params.dry_window
+    )
+    
+    # Get tuner outputs without modifying tuner state
+    tuner = decode_state.get("tuner")
+    current_config = tuner.config if tuner else DEFAULT_DS_CONFIG
+    
+    result = self.sample_fn(
+        decode_state["dslider_state"],
+        logits,
+        current_config,
+        key=rng
+    )
+    
+    new_state, new_token, naked_logprob, scaffold_logprob, \
+    scaffold_logprobs, naked_logprobs, cross_ent_naked, \
+    cross_ent_scaffold = result
 
-        jax.debug.print("Has tuner: {}", tuner is not None)
-        jax.debug.print("Current perturb base: {}", current_config.perturb_base_coeff)
-        
-        # Sample with current config
-        result = self.sample_fn(
-            decode_state["dslider_state"], 
-            logits[:, -1, :], 
-            current_config,
-            key=rng
-        )
-        
-        new_state, new_token, naked_logprob, scaffold_logprob, \
-        scaffold_logprobs, naked_logprobs, cross_ent_naked, \
-        cross_ent_scaffold = result
+    # Create a proper ResultTokens object instead of returning raw values
+    result_tokens = self._process_generate_result(
+        new_token,  # shape: (bsz, 1)
+        decode_state["generated_tokens"],
+        bsz
+    )
 
-        jax.debug.print("New token: {}", new_token)
-        jax.debug.print("Cross entropy diff: {}", cross_ent_naked - cross_ent_scaffold)
+    # Keep original tuner but use new config for next step
+    new_decode_state = {
+        "logits": logits,
+        "cache": kvcache,
+        "next_pos": decode_state["next_pos"] + 1,
+        "generated_tokens": decode_state["generated_tokens"] + 1,
+        "tokens": new_token,
+        "dslider_state": new_state,
+        "tuner": tuner,  # Keep original tuner
+        "config": current_config  # Use current config
+    }
 
-        # Update tuner outside jitted code
-        if tuner is not None:
-            config = tuner.update(
-                scaffold_logprobs,
-                naked_logprobs,
-                cross_ent_naked,
-                cross_ent_scaffold
-            )
-            tuner.config = config
-
-        new_token = new_token.reshape((bsz, 1))
-        result = self._process_generate_result(new_token, decode_state["generated_tokens"], bsz)
-
-        jax.debug.print("Next position: {}", decode_state["next_pos"] + 1)
-        jax.debug.print("Generated tokens: {}", decode_state["generated_tokens"] + 1)
-
-        return {
-            "logits": logits,
-            "cache": kvcache,
-            "next_pos": decode_state["next_pos"] + 1,
-            "generated_tokens": decode_state["generated_tokens"] + 1,
-            "tokens": new_token,
-            "dslider_state": new_state,
-            "tuner": tuner
-        }, result
-
-    except Exception as e:
-        jax.debug.print("Engine Error: {}", str(e))
-        raise
+    return new_decode_state, result_tokens
 
   @functools.partial(
     jax.jit,
@@ -513,13 +539,14 @@ class EntropixEngine:
     )
     new_cache = KVCache(k=new_k, v=new_v)
 
-    # Initialize the tuner with better parameters
+    # Initialize the tuner with INSANELY aggressive parameters
     tuner = OnlineTuner(
         config=DEFAULT_DS_CONFIG,
-        R=2.0,              
-        learning_rate=0.5,  # Increased from 0.1
-        momentum=0.95,      # Increased from 0.9
-        window_size=100
+        R=1.0001,         # Practically no smoothing at all (was 1.001)
+        learning_rate=2000.0,  # 4x more aggressive (was 500.0)
+        momentum=0.001,    # Almost no momentum (was 0.01)
+        window_size=1,     # Minimum possible window (was 2)
+        steps_per_window=50 # 5x more updates (was 10)
     )
 
     return {

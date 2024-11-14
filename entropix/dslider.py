@@ -5,6 +5,8 @@ from entropix.dslider_tuning import OnlineTuner
 import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
+from jax import lax
+from jax import vmap
 
 from entropix.dslider_config import EPS, MAX_TEMP, MIN_TEMP, DSConfig
 from entropix.dslider_utils import *
@@ -50,6 +52,7 @@ class DSState(NamedTuple):
   token_cross_var_naked: jnp.ndarray
   emwa_dir_ent: jnp.ndarray
   emwa_topk_ent_naked: jnp.ndarray
+  tokens: jnp.ndarray
 
 
 @partial(jax.jit, static_argnames=("bsz", "config", "dtype"))
@@ -94,11 +97,12 @@ def initialize_state(
     token_cross_var_naked=initial_cross_var_naked.repeat(bsz, axis=0),
     emwa_dir_ent=avg_dir_ent.repeat(bsz, axis=0),
     emwa_topk_ent_naked=avg_topk_ent.repeat(bsz, axis=0),
+    tokens=jnp.zeros((bsz,), dtype=jnp.int32),
   )
   return state
 
 
-@partial(jax.jit, static_argnames=("wild",))
+@partial(jax.jit, static_argnames=('wild',))
 def adaptive_dirichlet_step(
   key: jax.random.PRNGKey,
   state: DSState,
@@ -107,20 +111,17 @@ def adaptive_dirichlet_step(
   tuner: Optional[OnlineTuner] = None,
   wild: bool = True,
 ) -> Tuple[DSState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-  print("\nDirichlet Step Debug - Start")
+  print("\nDirichlet Step - Start")
   dtype = logits.dtype
   bsz, vsz = logits.shape
-  print(f"Input shapes - bsz: {bsz}, vsz: {vsz}")
 
   output_tokens = jnp.zeros(bsz, dtype=jnp.int32)
   EPS = jnp.array(1e-8, dtype=dtype)
   naked_log_probs = normalize_logits(logits, config.noise_floor)
-  print("Normalized logits")
 
   # update naked entropy rate
   naked_ent, naked_varent = ent_varent(naked_log_probs)
-  print(f"Naked entropy: {naked_ent}")
-  print(f"Naked varentropy: {naked_varent}")
+
 
   # fix shape issue!
   new_emwa_ent_naked = update_emwa(
@@ -243,6 +244,41 @@ def adaptive_dirichlet_step(
   interpolated_probs = perturb_coeff[:, None] * dir_probs + (
     1 - perturb_coeff[:, None]
   ) * jnp.exp(logprobs_on_supp)
+  # Apply EXTREME DRY penalty
+  interpolated_probs = apply_dry_penalty(
+    interpolated_probs,
+    state.tokens,
+    multiplier=10.0,    # 2x stronger (was 5.0)
+    base=5.0,           # Much faster growth (was 3.0)
+    allowed_length=0,   # No repeats allowed! (was 1)
+    window_size=1,   # 2x longer context (was 1024)
+    max_check_length=64 # 2x longer lookback (was 32)
+  )
+    
+  # Even wilder mode penalties
+  if wild:
+    # Apply stronger historical token penalties
+    token_mask = jnp.zeros(interpolated_probs.shape[-1])
+    token_mask = token_mask.at[state.tokens].add(1.0)
+    
+    # Stronger penalty for historical tokens
+    interpolated_probs = jnp.where(
+        token_mask > 0,
+        interpolated_probs - 5.0,  # 2.5x stronger (was 2.0)
+        interpolated_probs
+    )
+    
+    # Add more extreme random noise to coefficients
+    noise = jax.random.uniform(key, perturb_coeff.shape, minval=0.5, maxval=2.0)  # Much wider range
+    perturb_coeff = perturb_coeff * noise
+    
+    # More random noise to thresholds
+    noise = jax.random.uniform(key, dirichlet_threshold.shape, minval=0.5, maxval=1.1)
+    dirichlet_threshold = dirichlet_threshold * noise
+
+  # Ensure we don't have -inf or nan
+  interpolated_probs = jnp.nan_to_num(interpolated_probs, nan=-1e9, posinf=1e9, neginf=-1e9)
+
   # in use_dirichlet case take argmax of the slided probs
   dicihlet_choices = jnp.argmax(interpolated_probs, axis=-1)
   dirichlet_tokens = jnp.take(config.dirichlet_support, dicihlet_choices)
@@ -272,13 +308,6 @@ def adaptive_dirichlet_step(
     nan=0.0, posinf=1e6, neginf=-1e6
   )
 
-  # Add debug prints to track values
-  print("\nToken logprob debug:")
-  print(f"Scaffold token logprob: {scaffold_token_logprob}")
-  print(f"Naked token logprob: {naked_token_logprob}")
-  print(f"Interpolated probs: {interpolated_probs[batch_indices, output_tokens]}")
-  print(f"Naked logprobs: {naked_log_probs[batch_indices, output_tokens]}")
-
   (
     new_token_cross_ent_scaffold,
     new_token_cross_ent_naked,
@@ -287,17 +316,33 @@ def adaptive_dirichlet_step(
   ) = update_token_cross_entropies(
     state, scaffold_token_logprob, naked_token_logprob, config
   )
-  if tuner:
-    new_config, new_tuner = tuner.pure_update(
+  if tuner is not None:
+    # Instead of modifying tuner state directly, get new config only
+    tuner_outputs = tuner.pure_update(
         jnp.log(interpolated_probs + EPS),
         naked_log_probs,
         new_token_cross_ent_naked,
         new_token_cross_ent_scaffold
     )
-    config = new_config
-    tuner = new_tuner
+    # Unpack the returned values - don't modify tuner state
+    new_config = tuner_outputs[0]  # Get just the config
+    config = new_config  # Use new config for rest of function
 
-  # assemble new state
+  # First, let's add debug prints to understand the shapes
+  jax.debug.print("state.tokens shape: {}", state.tokens.shape)
+  jax.debug.print("output_tokens shape: {}", output_tokens.shape)
+  jax.debug.print("state.tokens: {}", state.tokens)
+  jax.debug.print("output_tokens: {}", output_tokens)
+
+  # Then fix the concatenation and slicing
+  if state.tokens.ndim == 1:
+    # If 1D, concatenate and take last 32 tokens
+    new_tokens = jnp.concatenate([state.tokens, output_tokens], axis=0)[-32:]
+  else:
+    # If 2D (batch, seq_len), concatenate along sequence dimension
+    new_tokens = jnp.concatenate([state.tokens, output_tokens[:, None]], axis=1)[:, -32:]
+
+  # Update state with proper tokens
   new_state = DSState(
     emwa_dir=new_emwa_dir,
     emwa_logp_on_supp=new_emwa_logp_on_supp,
@@ -312,6 +357,7 @@ def adaptive_dirichlet_step(
     token_cross_var_naked=new_token_cross_var_naked,
     emwa_dir_ent=new_emwa_dir_ent,
     emwa_topk_ent_naked=new_emwa_topk_ent_naked,
+    tokens=new_tokens
   )
 
   # Add debug prints
@@ -323,15 +369,6 @@ def adaptive_dirichlet_step(
   jax.debug.print("Dir probs entropy: {}", -jnp.sum(dir_probs * jnp.log(dir_probs + EPS), axis=-1))
   jax.debug.print("Logprobs entropy: {}", -jnp.sum(jnp.exp(logprobs_on_supp) * logprobs_on_supp, axis=-1))
   jax.debug.print("Output tokens: {}", output_tokens)
-
-  # Add randomness to break out of loops
-  if wild:
-    noise = jax.random.uniform(key, perturb_coeff.shape, minval=0.8, maxval=1.2)
-    perturb_coeff = perturb_coeff * noise
-    
-    # Add noise to dirichlet threshold
-    noise = jax.random.uniform(key, dirichlet_threshold.shape, minval=0.9, maxval=1.1)
-    dirichlet_threshold = dirichlet_threshold * noise
 
   print("\nDirichlet Step Debug - End")
 
@@ -411,3 +448,118 @@ def update_token_cross_entropies(
     token_cross_var_scaffold,
     token_cross_var_naked,
   )
+
+@partial(jax.jit, static_argnums=(6,))
+def apply_dry_penalty(
+    logits: jnp.ndarray,
+    tokens: jnp.ndarray,
+    multiplier: float = 5.0,
+    base: float = 3.0,
+    allowed_length: int = 1,
+    window_size: int = 1024,
+    max_check_length: int = 32
+) -> jnp.ndarray:
+    """Apply DRY penalty to logits to prevent repetitive sequences."""
+    
+    # Get batch size from logits
+    bsz = logits.shape[0]
+    
+    # Ensure tokens have shape (bsz, seq_len)
+    tokens = jnp.expand_dims(tokens, axis=0) if tokens.ndim == 1 else tokens
+    tokens = jnp.tile(tokens, (bsz, 1)) if tokens.shape[0] == 1 else tokens
+    
+    # Define static slice sizes
+    SLICE_SIZE = (max_check_length,)  # Static tuple for all slicing operations
+    
+    # Ensure we have at least 2 * max_check_length tokens by padding
+    padded_tokens = jnp.pad(
+        tokens,
+        ((0, 0), (2 * max_check_length, 0)),
+        mode='constant',
+        constant_values=0
+    )
+
+    def compute_penalty(tokens_padded_seq: jnp.ndarray, logits_seq: jnp.ndarray) -> jnp.ndarray:
+        penalties = jnp.zeros_like(logits_seq)
+        
+        def body_fn(i, penalties_acc):
+            # Calculate effective length (dynamic)
+            length = jnp.minimum(i + 1, max_check_length)
+            
+            # Calculate start positions (dynamic)
+            current_start = 2 * max_check_length - length
+            previous_start = 2 * max_check_length - 2 * length
+            
+            # Create slices with static size
+            current = lax.dynamic_slice(
+                tokens_padded_seq,
+                (current_start,),  # Dynamic start index is fine
+                SLICE_SIZE        # Static slice size
+            )
+            
+            previous = lax.dynamic_slice(
+                tokens_padded_seq,
+                (previous_start,),  # Dynamic start index is fine
+                SLICE_SIZE        # Static slice size
+            )
+            
+            # Create length mask
+            position_indices = jnp.arange(max_check_length)
+            length_mask = position_indices < length
+            
+            # Compare sequences using JAX operations with masking
+            comparison = jnp.equal(current, previous)
+            masked_comparison = comparison & length_mask[:, None]  # Broadcasting for potential token dimension
+            
+            # Check matches only within effective length
+            matches = jnp.all(jnp.where(length_mask, comparison, True))
+            
+            # Calculate penalty using pure JAX operations
+            penalty = jnp.where(
+                matches & (length > allowed_length),
+                multiplier * (base ** (length - allowed_length)),
+                0.0
+            )
+            
+            # Get last valid token using dynamic_index_in_dim
+            last_token = lax.dynamic_index_in_dim(current, length - 1, axis=0)
+            
+            # Update penalties using scatter_add
+            return penalties_acc.at[last_token].add(penalty)
+        
+        # Use fori_loop for the iteration
+        penalties = lax.fori_loop(
+            0,
+            max_check_length,
+            body_fn,
+            penalties
+        )
+        
+        # Handle recent token penalties with static slice size
+        seq_length = tokens_padded_seq.shape[0]
+        recent_start = seq_length - max_check_length
+        
+        # Extract recent tokens with static slice size
+        recent_tokens = lax.dynamic_slice(
+            tokens_padded_seq,
+            (recent_start,),
+            SLICE_SIZE
+        )
+        
+        # Create one-hot encoding
+        one_hot = jax.nn.one_hot(
+            recent_tokens,
+            num_classes=logits_seq.shape[-1],
+            dtype=logits_seq.dtype
+        )
+        
+        # Sum and scale recent penalties
+        recent_penalties = jnp.sum(one_hot, axis=0) * 0.5
+        
+        # Add recent penalties to the accumulated penalties
+        return penalties + recent_penalties
+
+    # Use vmap to process each batch element independently
+    penalties = jax.vmap(compute_penalty, in_axes=(0, 0))(padded_tokens, logits)
+    
+    return logits - penalties

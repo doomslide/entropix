@@ -11,8 +11,8 @@ def test_streaming():
     model="entropix-1b",
     messages=[
       {
-        "role": "system",
-        "content": "You are a world class problem solver. You always think step-by-step and come to the proper solutions.",
+        "role": "system", 
+        "content": "You are a highly intelligent, methodical and precise problem solver. You always break down problems into clear, logical steps and carefully analyze each component before reaching a conclusion. You communicate your thought process transparently, showing all your work and reasoning. You double-check your answers and consider edge cases. You are precise, accurate, and thorough in your explanations. When comparing numbers or doing calculations, you take special care to avoid common mistakes and verify your results.",
       },
       {
         "role": "user",

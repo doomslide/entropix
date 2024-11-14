@@ -1,9 +1,12 @@
 from functools import partial
-from typing import NamedTuple, Dict, Tuple
+from typing import NamedTuple, Dict, Tuple, Any
 import jax
 import jax.numpy as jnp
 from entropix.dslider_config import DSConfig, OutlierThreshold, DirichletThreshold, ArgmaxThreshold, TargetEntropy
 from jax.tree_util import register_pytree_node_class
+
+# jax.config.update('jax_disable_jit', True)
+
 class TuningStats(NamedTuple):
     cross_ent_diff: float
     renyi_div: float
@@ -46,15 +49,18 @@ class OnlineTuner:
         learning_rate: float = 0.01,
         momentum: float = 0.9,
         window_size: int = 100,
+        steps_per_window: int = 5,
     ):
         assert R > 1, "R must be greater than 1"
         self.config = config
         self.R = R
-        self.alpha = 1.0 / R  # For Rényi divergence
+        self.alpha = 1.0 / R
         self.lr = learning_rate
         self.momentum = momentum
-        self.idx = 0
-        self.max_idx = 50
+        self.window_size = window_size
+        self.steps_per_window = steps_per_window
+        self.stats_buffer = []
+        self.total_steps = 0
 
         # Initialize parameter momentum buffers
         self.param_momentum = {
@@ -66,11 +72,6 @@ class OnlineTuner:
             'perturb_base': jnp.array(0.0),
             'perturb_exp': jnp.array(0.0)
         }
-
-        # Statistics tracking
-        self.window_size = window_size
-        self.stats_buffer = []
-        self.total_steps = 0
 
     def tree_flatten(self):
         """For JAX pytree handling"""
@@ -135,43 +136,57 @@ class OnlineTuner:
         token_cross_ent_naked: jnp.ndarray,
         token_cross_ent_scaffold: jnp.ndarray
     ) -> TuningStats:
-        """Compute current performance metrics"""
-        # Cross entropy difference - add numerical stability
-        cross_ent_diff = jnp.mean(jnp.nan_to_num(
-            token_cross_ent_naked - token_cross_ent_scaffold,
-            nan=0.0, posinf=1e6, neginf=-1e6
-        ))
-
-        # Convert logprobs to probs with numerical stability
-        scaffold_probs = jnp.exp(jnp.clip(scaffold_logprobs, -1e6, 1e6))
-        naked_probs = jnp.exp(jnp.clip(naked_logprobs, -1e6, 1e6))
-
-        # Normalize probabilities
-        scaffold_probs = scaffold_probs / jnp.sum(scaffold_probs, axis=-1, keepdims=True)
-        naked_probs = naked_probs / jnp.sum(naked_probs, axis=-1, keepdims=True)
-
-        # Compute KL divergence with numerical stability
-        kl_div = jnp.mean(jnp.sum(
-            scaffold_probs * jnp.clip(scaffold_logprobs - naked_logprobs, -1e6, 1e6),
-            axis=-1
-        ))
-
-        # Compute Rényi divergence with α = 1/R
-        renyi_div = jnp.mean(renyi_divergence(scaffold_probs, naked_probs, self.alpha))
-
-        # Combined score using the same weighting
-        combined_score = jnp.nan_to_num(
-            (1.0/self.R) * cross_ent_diff + ((self.R-1.0)/self.R) * renyi_div,
-            nan=0.0, posinf=1e6, neginf=-1e6
-        )
-
-        # Compute gradients for parameters
-        param_gradients = self.compute_parameter_gradients(
-            scaffold_logprobs, naked_logprobs,
-            token_cross_ent_naked, token_cross_ent_scaffold
-        )
-
-        return TuningStats(cross_ent_diff, renyi_div, combined_score, kl_div, param_gradients)
+        """Compute tuning metrics with enhanced safety checks"""
+        try:
+            # Convert inputs to probabilities safely
+            scaffold_probs = jnp.clip(jnp.exp(scaffold_logprobs), 1e-10, 1.0)
+            naked_probs = jnp.clip(jnp.exp(naked_logprobs), 1e-10, 1.0)
+            
+            # Normalize probabilities
+            scaffold_probs = scaffold_probs / jnp.sum(scaffold_probs, axis=-1, keepdims=True)
+            naked_probs = naked_probs / jnp.sum(naked_probs, axis=-1, keepdims=True)
+            
+            # Compute cross entropy difference
+            cross_ent_diff = jnp.mean(token_cross_ent_naked - token_cross_ent_scaffold)
+            
+            # Compute Renyi divergence safely
+            renyi_div = jnp.mean(renyi_divergence(scaffold_probs, naked_probs, 1.0/self.R))
+            
+            # Compute KL divergence safely
+            kl_div = jnp.mean(jnp.sum(
+                scaffold_probs * (jnp.log(scaffold_probs + 1e-10) - jnp.log(naked_probs + 1e-10)),
+                axis=-1
+            ))
+            
+            # Compute combined score
+            combined_score = (1.0/self.R) * cross_ent_diff + ((self.R-1.0)/self.R) * renyi_div
+            
+            # Compute parameter gradients with safety checks
+            param_gradients = self.compute_parameter_gradients(
+                scaffold_logprobs,
+                naked_logprobs,
+                token_cross_ent_naked,
+                token_cross_ent_scaffold
+            )
+            
+            return TuningStats(
+                cross_ent_diff=cross_ent_diff,
+                renyi_div=renyi_div,
+                combined_score=combined_score,
+                kl_div=kl_div,
+                param_gradients=param_gradients
+            )
+            
+        except Exception as e:
+            jax.debug.print("Metrics Computation Error: {}", str(e))
+            # Return safe default values
+            return TuningStats(
+                cross_ent_diff=0.0,
+                renyi_div=0.0,
+                combined_score=0.0,
+                kl_div=0.0,
+                param_gradients={}
+            )
 
     def get_summary(self) -> str:
         """Generate a summary of tuning statistics"""
@@ -216,97 +231,109 @@ Current Parameter Values:
         token_cross_ent_scaffold: jnp.ndarray
     ) -> DSConfig:
         """Update tuner state and return optimized config"""
-        # Compute current metrics and gradients
-        stats = self.compute_metrics(
-            scaffold_logprobs,
-            naked_logprobs,
-            token_cross_ent_naked,
-            token_cross_ent_scaffold
-        )
-
-        print("\nGradients:")
-        for param_name, gradient in stats.param_gradients.items():
-            # Handle NaN gradients
-            gradient = jnp.nan_to_num(gradient, nan=0.0, posinf=1.0, neginf=-1.0)
-            print(f"{param_name}: {gradient}")
-
-        # Update momentum buffers and apply gradients
-        print("\nMomentum Updates:")
-        for param_name, gradient in stats.param_gradients.items():
-            # Handle NaN gradients
-            gradient = jnp.nan_to_num(gradient, nan=0.0, posinf=1.0, neginf=-1.0)
-            
-            old_momentum = self.param_momentum[param_name]
-            # Handle NaN momentum
-            old_momentum = jnp.nan_to_num(old_momentum, nan=0.0, posinf=1.0, neginf=-1.0)
-            
-            self.param_momentum[param_name] = (
-                self.momentum * old_momentum +
-                (1 - self.momentum) * gradient
+        try:
+            # Compute current metrics and gradients
+            stats = self.compute_metrics(
+                scaffold_logprobs,
+                naked_logprobs,
+                token_cross_ent_naked,
+                token_cross_ent_scaffold
             )
-            print(f"{param_name} momentum: {old_momentum} -> {self.param_momentum[param_name]}")
-            
-            # Actually apply the gradient update with clipping
-            print(f"\nParameter Updates for {param_name}:")
-            update = jnp.clip(self.lr * self.param_momentum[param_name], -0.1, 0.1)
-            # Handle NaN updates
-            update = jnp.nan_to_num(update, nan=0.0, posinf=0.1, neginf=-0.1)
-            
-            if param_name == 'outlier_bilinear':
-                old_val = self.config.outlier_threshold.bilinear
-                self.config.outlier_threshold.bilinear += update
-                # Keep positive
-                self.config.outlier_threshold.bilinear = jnp.maximum(self.config.outlier_threshold.bilinear, 0.1)
-                print(f"Old: {old_val}, Update: {update}, New: {self.config.outlier_threshold.bilinear}")
-                
-            elif param_name == 'outlier_linear_state_ent':
-                old_val = self.config.outlier_threshold.linear_state_ent
-                self.config.outlier_threshold.linear_state_ent += update
-                self.config.outlier_threshold.linear_state_ent = jnp.maximum(self.config.outlier_threshold.linear_state_ent, 0.1)
-                print(f"Old: {old_val}, Update: {update}, New: {self.config.outlier_threshold.linear_state_ent}")
-                
-            elif param_name == 'outlier_linear_state_std':
-                old_val = self.config.outlier_threshold.linear_state_std
-                self.config.outlier_threshold.linear_state_std += update
-                self.config.outlier_threshold.linear_state_std = jnp.maximum(self.config.outlier_threshold.linear_state_std, 0.1)
-                print(f"Old: {old_val}, Update: {update}, New: {self.config.outlier_threshold.linear_state_std}")
-                
-            elif param_name == 'dirichlet_weight':
-                old_val = self.config.dirichlet_threshold.weight
-                self.config.dirichlet_threshold.weight += update
-                self.config.dirichlet_threshold.weight = jnp.maximum(self.config.dirichlet_threshold.weight, 0.01)
-                print(f"Old: {old_val}, Update: {update}, New: {self.config.dirichlet_threshold.weight}")
-                
-            elif param_name == 'dirichlet_bias':
-                old_val = self.config.dirichlet_threshold.bias
-                self.config.dirichlet_threshold.bias += update
-                print(f"Old: {old_val}, Update: {update}, New: {self.config.dirichlet_threshold.bias}")
-                
-            elif param_name == 'perturb_base':
-                old_val = self.config.perturb_base_coeff
-                self.config.perturb_base_coeff += update
-                self.config.perturb_base_coeff = jnp.maximum(self.config.perturb_base_coeff, 1.0)
-                print(f"Old: {old_val}, Update: {update}, New: {self.config.perturb_base_coeff}")
-                
-            elif param_name == 'perturb_exp':
-                old_val = self.config.perturb_exp_coeff
-                self.config.perturb_exp_coeff += update
-                self.config.perturb_exp_coeff = jnp.maximum(self.config.perturb_exp_coeff, 0.1)
-                print(f"Old: {old_val}, Update: {update}, New: {self.config.perturb_exp_coeff}")
 
-        # Update statistics buffer
-        self.stats_buffer.append(stats)
-        if len(self.stats_buffer) > self.window_size:
-            self.stats_buffer.pop(0)
-        self.total_steps += 1
+            # Print key metrics first
+            # print("\nStep", self.total_steps)
+            # print(f"Objective Score: {stats.combined_score:.4f}")
+            # print(f"Cross Entropy Diff: {stats.cross_ent_diff:.4f}")
+            # print(f"Renyi Divergence: {stats.renyi_div:.4f}")
+            # print(f"KL Divergence: {stats.kl_div:.4f}")
 
-        print("\nMetrics:")
-        print(f"Cross Entropy Diff: {stats.cross_ent_diff}")
-        print(f"Renyi Divergence: {stats.renyi_div}")
-        print(f"KL Divergence: {stats.kl_div}")
-        print(f"Combined Score: {stats.combined_score}\n")
+            # Print only non-zero gradients
+            print("\nSignificant Gradients:")
+            for param_name, gradient in stats.param_gradients.items():
+                gradient = jnp.nan_to_num(gradient, nan=0.0, posinf=1.0, neginf=-1.0)
+                if abs(gradient) > 1e-6:  # Only print meaningful gradients
+                    print(f"{param_name}: {gradient:.4f}")
 
-        return self.config
+            # Update momentum buffers and apply gradients
+            for param_name, gradient in stats.param_gradients.items():
+                # Handle NaN gradients
+                gradient = jnp.nan_to_num(gradient, nan=0.0, posinf=1.0, neginf=-1.0)
+                
+                old_momentum = self.param_momentum[param_name]
+                # Handle NaN momentum
+                old_momentum = jnp.nan_to_num(old_momentum, nan=0.0, posinf=1.0, neginf=-1.0)
+                
+                self.param_momentum[param_name] = (
+                    self.momentum * old_momentum +
+                    (1 - self.momentum) * gradient
+                )
+                
+                # Actually apply the gradient update with clipping
+                update = jnp.clip(self.lr * self.param_momentum[param_name], -0.1, 0.1)
+                # Handle NaN updates
+                update = jnp.nan_to_num(update, nan=0.0, posinf=0.1, neginf=-0.1)
+                
+                if param_name == 'outlier_bilinear':
+                    old_val = self.config.outlier_threshold.bilinear
+                    new_val = old_val + update
+                    # Keep positive
+                    self.config.outlier_threshold.bilinear = jnp.maximum(self.config.outlier_threshold.bilinear, 0.1)
+                    print(f"\n{param_name}:")
+                    print(f"  Old: {old_val:.4f} → New: {new_val:.4f} (Δ: {update:.4f})")
+                    
+                elif param_name == 'outlier_linear_state_ent':
+                    old_val = self.config.outlier_threshold.linear_state_ent
+                    new_val = old_val + update
+                    self.config.outlier_threshold.linear_state_ent = jnp.maximum(self.config.outlier_threshold.linear_state_ent, 0.1)
+                    print(f"\n{param_name}:")
+                    print(f"  Old: {old_val:.4f} → New: {new_val:.4f} (Δ: {update:.4f})")
+                    
+                elif param_name == 'outlier_linear_state_std':
+                    old_val = self.config.outlier_threshold.linear_state_std
+                    new_val = old_val + update
+                    self.config.outlier_threshold.linear_state_std = jnp.maximum(self.config.outlier_threshold.linear_state_std, 0.1)
+                    print(f"\n{param_name}:")
+                    print(f"  Old: {old_val:.4f} → New: {new_val:.4f} (Δ: {update:.4f})")
+                    
+                elif param_name == 'dirichlet_weight':
+                    old_val = self.config.dirichlet_threshold.weight
+                    new_val = old_val + update
+                    self.config.dirichlet_threshold.weight = jnp.maximum(self.config.dirichlet_threshold.weight, 0.01)
+                    print(f"\n{param_name}:")
+                    print(f"  Old: {old_val:.4f} → New: {new_val:.4f} (Δ: {update:.4f})")
+                    
+                elif param_name == 'dirichlet_bias':
+                    old_val = self.config.dirichlet_threshold.bias
+                    new_val = old_val + update
+                    print(f"\n{param_name}:")
+                    print(f"  Old: {old_val:.4f} → New: {new_val:.4f} (Δ: {update:.4f})")
+                    
+                elif param_name == 'perturb_base':
+                    old_val = self.config.perturb_base_coeff
+                    new_val = old_val + update
+                    self.config.perturb_base_coeff = jnp.maximum(self.config.perturb_base_coeff, 1.0)
+                    print(f"\n{param_name}:")
+                    print(f"  Old: {old_val:.4f} → New: {new_val:.4f} (Δ: {update:.4f})")
+                    
+                elif param_name == 'perturb_exp':
+                    old_val = self.config.perturb_exp_coeff
+                    new_val = old_val + update
+                    self.config.perturb_exp_coeff = jnp.maximum(self.config.perturb_exp_coeff, 0.1)
+                    print(f"\n{param_name}:")
+                    print(f"  Old: {old_val:.4f} → New: {new_val:.4f} (Δ: {update:.4f})")
+
+            # Update statistics buffer
+            self.stats_buffer.append(stats)
+            if len(self.stats_buffer) > self.window_size:
+                self.stats_buffer.pop(0)
+            self.total_steps += 1
+
+            return self.config
+
+        except Exception as e:
+            print(f"Warning: Tuner update failed: {str(e)}")
+            print("Continuing with unchanged config")
+            return self.config
 
     @partial(jax.jit, static_argnames=('self',))
     def compute_parameter_gradients(
@@ -321,7 +348,7 @@ Current Parameter Values:
         score = (1/R) * (cross_ent_naked - cross_ent_scaffold) +
                 ((R-1)/R) * D_{1/R}(scaffold_logprobs||naked_logprobs)
         """
-        def objective_fn(params):
+        def objective_fn(float_params):
             # Compute entropies - make sure they're all the same shape
             scaffold_entropy = -jnp.sum(jnp.exp(scaffold_logprobs_input) * scaffold_logprobs_input, axis=-1)
             naked_entropy = -jnp.sum(jnp.exp(naked_logprobs_input) * naked_logprobs_input, axis=-1)
@@ -332,11 +359,11 @@ Current Parameter Values:
 
             # Get state entropy vector - shape (bsz, 4) with NaN handling
             state_ent = jnp.nan_to_num(jnp.stack([
-                token_cross_ent_scaffold_reshaped,  # token cross entropy scaffold
-                token_cross_ent_naked_reshaped,     # token cross entropy naked
-                scaffold_entropy,                    # scaffold entropy
-                naked_entropy                        # naked entropy
-            ], axis=1), nan=0.0)  # Replace NaN with 0.0
+                token_cross_ent_scaffold_reshaped,
+                token_cross_ent_naked_reshaped,
+                scaffold_entropy,
+                naked_entropy
+            ], axis=1), nan=0.0)
 
             # Compute variances with NaN handling
             scaffold_varent = jnp.nan_to_num(jnp.var(scaffold_entropy), nan=0.0)
@@ -350,10 +377,10 @@ Current Parameter Values:
                 jnp.full_like(scaffold_entropy, jnp.sqrt(cross_var_naked)),
                 jnp.full_like(scaffold_entropy, jnp.sqrt(scaffold_varent)),
                 jnp.full_like(scaffold_entropy, jnp.sqrt(naked_varent))
-            ], axis=1), nan=0.0)  # Replace NaN with 0.0
+            ], axis=1), nan=0.0)
 
             # Get dirichlet entropy
-            dir_ent = scaffold_entropy  # Use scaffold entropy for dirichlet
+            dir_ent = scaffold_entropy
 
             # Compute cross entropy difference
             cross_ent_diff = jnp.mean(token_cross_ent_naked - token_cross_ent_scaffold)
@@ -371,35 +398,33 @@ Current Parameter Values:
 
             # Compute thresholds with NaN handling
             outlier_threshold = jnp.nan_to_num(
-                jnp.einsum('bi,ij,bj->b', state_ent, params['outlier_bilinear'], state_std) +
-                jnp.einsum('bi,i->b', state_ent, params['outlier_linear_state_ent']) +
-                jnp.einsum('bi,i->b', state_std, params['outlier_linear_state_std']),
+                jnp.einsum('bi,ij,bj->b', state_ent, float_params['outlier_bilinear'], state_std) +
+                jnp.einsum('bi,i->b', state_ent, float_params['outlier_linear_state_ent']) +
+                jnp.einsum('bi,i->b', state_std, float_params['outlier_linear_state_std']),
                 nan=0.0
             )
 
-            dirichlet_threshold = params['dirichlet_weight'] * dir_ent + params['dirichlet_bias']
+            dirichlet_threshold = float_params['dirichlet_weight'] * dir_ent + float_params['dirichlet_bias']
 
             # Compute perturbation coefficient
             kl = jnp.sum(jnp.exp(scaffold_logprobs_input) * (scaffold_logprobs_input - naked_logprobs_input), axis=-1)
-            perturb_coeff = params['perturb_base'] / (1 + jnp.exp(params['perturb_exp'] * kl))
+            perturb_coeff = float_params['perturb_base'] / (1 + jnp.exp(float_params['perturb_exp'] * kl))
 
             # Compute objective terms
-            outlier_term = jnp.mean(jnp.abs(outlier_threshold))  # Encourage non-zero thresholds
-            dirichlet_term = jnp.mean(jnp.abs(dirichlet_threshold))  # Encourage non-zero thresholds
-            perturb_term = jnp.mean(perturb_coeff)  # Encourage larger perturbation
+            outlier_term = jnp.mean(jnp.abs(outlier_threshold))
+            dirichlet_term = jnp.mean(jnp.abs(dirichlet_threshold))
+            perturb_term = jnp.mean(perturb_coeff)
             
             # Add entropy bonus to encourage exploration
             entropy_bonus = -jnp.mean(
-                jnp.sum(scaffold_probs * jnp.log(scaffold_probs + 1e-10), axis=-1)
+                jnp.sum(naked_probs * jnp.log(naked_probs + 1e-10), axis=-1)
             )
 
             # Combined objective with exploration bonus
-            return (1.0/self.R) * cross_ent_diff + ((self.R-1.0)/self.R) * renyi_div + \
-                   0.1 * outlier_term + 0.1 * dirichlet_term + 0.1 * perturb_term + \
-                   0.05 * entropy_bonus  # Add entropy bonus with smaller weight
+            return (1.0/self.R) * cross_ent_diff + ((self.R-1.0)/self.R) * renyi_div + entropy_bonus
 
         # Get current parameter values - ensure all are float32
-        params = {
+        float_params = {
             'outlier_bilinear': jnp.asarray(self.config.outlier_threshold.bilinear, dtype=jnp.float32),
             'outlier_linear_state_ent': jnp.asarray(self.config.outlier_threshold.linear_state_ent, dtype=jnp.float32),
             'outlier_linear_state_std': jnp.asarray(self.config.outlier_threshold.linear_state_std, dtype=jnp.float32),
@@ -409,124 +434,165 @@ Current Parameter Values:
             'perturb_exp': jnp.asarray(self.config.perturb_exp_coeff, dtype=jnp.float32)
         }
 
-        # Use the fixed dirichlet_support from config
-        dirichlet_support = jnp.asarray(self.config.dirichlet_support, dtype=jnp.int32)
-
-        def wrapped_objective_fn(float_params):
-            # Reconstruct full params dict with both float and int params
-            full_params = {
-                **float_params,
-                'dirichlet_support': dirichlet_support  # Use fixed integer array
-            }
-            return objective_fn(full_params)
-
         # Compute gradients through the full computation
-        gradients = jax.grad(wrapped_objective_fn)(params)
+        gradients = jax.grad(objective_fn)(float_params)
         return gradients
 
+    @partial(jax.jit, static_argnames=('self',))
     def pure_update(
         self,
         scaffold_logprobs: jnp.ndarray,
         naked_logprobs: jnp.ndarray,
         token_cross_ent_naked: jnp.ndarray,
         token_cross_ent_scaffold: jnp.ndarray
-    ) -> Tuple[DSConfig, "OnlineTuner"]:
-        """Pure version of update that returns new state instead of modifying in place"""
-        # Compute current metrics and gradients
-        stats = self.compute_metrics(
-            scaffold_logprobs,
-            naked_logprobs,
-            token_cross_ent_naked,
-            token_cross_ent_scaffold
-        )
-
-        # Create new momentum values with updates
-        new_momentum = {}
-        for param_name, gradient in stats.param_gradients.items():
-            old_momentum = self.param_momentum[param_name]
-            new_momentum[param_name] = (
-                self.momentum * old_momentum +
-                (1 - self.momentum) * gradient
+    ) -> Tuple[DSConfig, 'OnlineTuner']:
+        """Pure functional update that returns new config and tuner state"""
+        try:
+            # Add current stats to buffer
+            stats = self.compute_metrics(
+                scaffold_logprobs,
+                naked_logprobs,
+                token_cross_ent_naked,
+                token_cross_ent_scaffold
             )
+            new_stats_buffer = self.stats_buffer + [stats]
+            if len(new_stats_buffer) > self.window_size:
+                new_stats_buffer = new_stats_buffer[-self.window_size:]
 
-        # Create new config with updated parameters
+            # Only perform optimization steps when buffer is full
+            if len(new_stats_buffer) == self.window_size:
+                current_config = self.config
+                new_momentum = dict(self.param_momentum)
+
+                # Perform multiple optimization steps on the collected window
+                for _ in range(self.steps_per_window):
+                    # Compute average gradients over window
+                    avg_gradients = {}
+                    for stat in new_stats_buffer:
+                        for param_name, grad in stat.param_gradients.items():
+                            if param_name not in avg_gradients:
+                                avg_gradients[param_name] = jnp.zeros_like(grad)
+                            avg_gradients[param_name] += grad / self.window_size
+
+                    # Update momentum and parameters
+                    for param_name, avg_grad in avg_gradients.items():
+                        # Update momentum with almost no clipping
+                        new_momentum[param_name] = (
+                            self.momentum * new_momentum[param_name] +
+                            (1 - self.momentum) * avg_grad
+                        )
+                        
+                        # Compute update with MASSIVE range
+                        update = jnp.clip(
+                            self.lr * new_momentum[param_name],
+                            -50.0,  # 200x larger range (was -0.25)
+                            50.0    # 200x larger range (was 0.25)
+                        )
+
+                        # Update config functionally
+                        current_config = self._apply_param_update(
+                            current_config,
+                            param_name,
+                            update
+                        )
+
+                new_config = current_config
+            else:
+                new_config = self.config
+                new_momentum = self.param_momentum
+
+            # Create new tuner state
+            new_tuner = OnlineTuner(
+                config=new_config,
+                R=self.R,
+                learning_rate=self.lr,
+                momentum=self.momentum,
+                window_size=self.window_size,
+                steps_per_window=self.steps_per_window
+            )
+            new_tuner.param_momentum = new_momentum
+            new_tuner.stats_buffer = new_stats_buffer
+            new_tuner.total_steps = self.total_steps + 1
+
+            return new_config, new_tuner
+
+        except Exception as e:
+            jax.debug.print("Error during update: {}", str(e))
+            return self.config, self
+
+    def _apply_param_update(self, config: DSConfig, param_name: str, update: jnp.ndarray) -> DSConfig:
+        """Helper method to apply parameter updates to config functionally"""
+        # Create new config with same values
         new_config = DSConfig(
-            # Keep all non-tuned parameters the same
-            emwa_logp_base=self.config.emwa_logp_base,
-            emwa_logp_exp_factor=self.config.emwa_logp_exp_factor,
-            emwa_dir_coeff=self.config.emwa_dir_coeff,
-            emwa_temp_coeff=self.config.emwa_temp_coeff,
-            emwa_dir_ent_coeff=self.config.emwa_dir_ent_coeff,
-            emwa_ent_scaffold_coeff=self.config.emwa_ent_scaffold_coeff,
-            emwa_varent_scaffold_coeff=self.config.emwa_varent_scaffold_coeff,
-            emwa_ent_naked_coeff=self.config.emwa_ent_naked_coeff,
-            emwa_varent_naked_coeff=self.config.emwa_varent_naked_coeff,
-            emwa_topk_ent_naked_coeff=self.config.emwa_topk_ent_naked_coeff,
-            token_cross_ent_scaffold_coeff=self.config.token_cross_ent_scaffold_coeff,
-            token_cross_ent_naked_coeff=self.config.token_cross_ent_naked_coeff,
-            token_cross_var_scaffold_coeff=self.config.token_cross_var_scaffold_coeff,
-            token_cross_var_naked_coeff=self.config.token_cross_var_naked_coeff,
-            dirichlet_support=self.config.dirichlet_support,
-            noise_floor=self.config.noise_floor,
-            outlier_topk=self.config.outlier_topk,
-
-            # Update tuned parameters with clipped values
+            emwa_logp_base=config.emwa_logp_base,
+            emwa_logp_exp_factor=config.emwa_logp_exp_factor,
+            emwa_dir_coeff=config.emwa_dir_coeff,
+            emwa_temp_coeff=config.emwa_temp_coeff,
+            emwa_dir_ent_coeff=config.emwa_dir_ent_coeff,
+            emwa_ent_scaffold_coeff=config.emwa_ent_scaffold_coeff,
+            emwa_varent_scaffold_coeff=config.emwa_varent_scaffold_coeff,
+            emwa_ent_naked_coeff=config.emwa_ent_naked_coeff,
+            emwa_varent_naked_coeff=config.emwa_varent_naked_coeff,
+            emwa_topk_ent_naked_coeff=config.emwa_topk_ent_naked_coeff,
+            token_cross_ent_scaffold_coeff=config.token_cross_ent_scaffold_coeff,
+            token_cross_ent_naked_coeff=config.token_cross_ent_naked_coeff,
+            token_cross_var_scaffold_coeff=config.token_cross_var_scaffold_coeff,
+            token_cross_var_naked_coeff=config.token_cross_var_naked_coeff,
+            perturb_base_coeff=config.perturb_base_coeff,
+            perturb_exp_coeff=config.perturb_exp_coeff,
+            dirichlet_support=config.dirichlet_support,
+            noise_floor=config.noise_floor,
             outlier_threshold=OutlierThreshold(
-                bilinear=jnp.maximum(
-                    self.config.outlier_threshold.bilinear + 
-                    self.lr * new_momentum['outlier_bilinear'],
-                    0.1
-                ),
-                linear_state_ent=jnp.maximum(
-                    self.config.outlier_threshold.linear_state_ent + 
-                    self.lr * new_momentum['outlier_linear_state_ent'],
-                    0.1
-                ),
-                linear_state_std=jnp.maximum(
-                    self.config.outlier_threshold.linear_state_std + 
-                    self.lr * new_momentum['outlier_linear_state_std'],
-                    0.1
-                ),
-                linear_naked_ent=self.config.outlier_threshold.linear_naked_ent,
-                linear_naked_std=self.config.outlier_threshold.linear_naked_std,
-                linear_naked_varent=self.config.outlier_threshold.linear_naked_varent,
-                bias=self.config.outlier_threshold.bias
+                bilinear=config.outlier_threshold.bilinear,
+                linear_state_ent=config.outlier_threshold.linear_state_ent,
+                linear_state_std=config.outlier_threshold.linear_state_std,
+                linear_naked_ent=config.outlier_threshold.linear_naked_ent,
+                linear_naked_std=config.outlier_threshold.linear_naked_std,
+                linear_naked_varent=config.outlier_threshold.linear_naked_varent,
+                bias=config.outlier_threshold.bias
             ),
-            argmax_threshold=self.config.argmax_threshold,
+            argmax_threshold=config.argmax_threshold,
             dirichlet_threshold=DirichletThreshold(
-                weight=jnp.maximum(
-                    self.config.dirichlet_threshold.weight + 
-                    self.lr * new_momentum['dirichlet_weight'],
-                    0.01
-                ),
-                bias=self.config.dirichlet_threshold.bias + 
-                     self.lr * new_momentum['dirichlet_bias']
+                weight=config.dirichlet_threshold.weight,
+                bias=config.dirichlet_threshold.bias
             ),
-            target_entropy=self.config.target_entropy,
-            perturb_base_coeff=jnp.maximum(
-                self.config.perturb_base_coeff + 
-                self.lr * new_momentum['perturb_base'],
-                1.0
-            ),
-            perturb_exp_coeff=jnp.maximum(
-                self.config.perturb_exp_coeff + 
-                self.lr * new_momentum['perturb_exp'],
-                0.1
+            target_entropy=config.target_entropy,
+            outlier_topk=config.outlier_topk
+        )
+
+        # Apply updates functionally
+        if param_name == 'outlier_bilinear':
+            new_config.outlier_threshold.bilinear = jnp.maximum(
+                config.outlier_threshold.bilinear + update, 
+                1e-6  
             )
-        )
-
-        # Create new tuner with updated state
-        new_tuner = OnlineTuner(
-            config=new_config,
-            R=self.R,
-            learning_rate=self.lr,
-            momentum=self.momentum,
-            window_size=self.window_size
-        )
-        new_tuner.param_momentum = new_momentum
-        new_tuner.stats_buffer = self.stats_buffer + [stats]
-        new_tuner.total_steps = self.total_steps + 1
-
-        return new_config, new_tuner
+        elif param_name == 'outlier_linear_state_ent':
+            new_config.outlier_threshold.linear_state_ent = jnp.maximum(
+                config.outlier_threshold.linear_state_ent + update,
+                1e-6  
+            )
+        elif param_name == 'outlier_linear_state_std':
+            new_config.outlier_threshold.linear_state_std = jnp.maximum(
+                config.outlier_threshold.linear_state_std + update,
+                1e-6  
+            )
+        elif param_name == 'dirichlet_weight':
+            new_config.dirichlet_threshold.weight = jnp.maximum(
+                config.dirichlet_threshold.weight + update,
+                1e-8  
+            )
+        elif param_name == 'dirichlet_bias':
+            new_config.dirichlet_threshold.bias = config.dirichlet_threshold.bias + update  # No minimum at all
+        elif param_name == 'perturb_base':
+            new_config.perturb_base_coeff = jnp.maximum(
+                config.perturb_base_coeff + update,
+                1e-3  
+            )
+        elif param_name == 'perturb_exp':
+            new_config.perturb_exp_coeff = jnp.maximum(
+                config.perturb_exp_coeff + update,
+                1e-6  
+            )
+        return new_config
 
 register_pytree_node_class(OnlineTuner)
