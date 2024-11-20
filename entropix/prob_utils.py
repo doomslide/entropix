@@ -48,13 +48,7 @@ def entropy(logp: jnp.ndarray) -> jnp.ndarray:
     return -jnp.sum(p * logp, axis=-1)
 
 @jax.jit
-def renyi_entropy(
-    logp: jax.Array, 
-    alphas: jax.Array, 
-    small_alpha: float = SMALL_ALPHA, 
-    large_alpha: float=LARGE_ALPHA, 
-    small_one_minus_alpha: float = SMALL_ONE_MINUS_ALPHA
-) -> jax.Array:
+def renyi_entropy(logp: jax.Array, alphas: jax.Array) -> jax.Array:
     """
     Compute the Rényi entropy for given log probabilities and alpha values.
     
@@ -67,32 +61,66 @@ def renyi_entropy(
         jnp.ndarray: Rényi entropies, shape (..., num_alphas) where ... matches the
                     leading dimensions of input logp
     """
-
-    # Expand alphas to align with logp dimensions for broadcasting
-    alphas_expanded = alphas.reshape((1,) * (logp.ndim - 1) + alphas.shape)
-    # Compute probabilities from log probabilities
-    p = jnp.exp(logp)
-    # Create masks for different alpha cases
-    mask_shannon = jnp.abs(alphas_expanded - 1.0) < small_one_minus_alpha
-    mask_max = alphas_expanded > large_alpha
-    mask_min = alphas_expanded < small_alpha
-    # Shannon entropy approximation
-    shannon_entropy = -jnp.sum(p * logp, axis=-1)
-    # Argmax approximation for very large alpha
-    max_p = jnp.max(p, axis=-1)
-    max_entropy = -jnp.log(max_p)
-    # Argmin approximation for very small alpha
-    min_p = jnp.min(p, axis=-1)
-    min_entropy = -jnp.log(min_p)
-    # General Renyi entropy computation
-    sum_p_alpha = jnp.sum(p ** alphas_expanded, axis=-1)
-    renyi = jnp.log(sum_p_alpha) / (1 - alphas_expanded)
-    # Combine results based on the masks
-    entropy = jnp.where(mask_shannon,shannon_entropy,jnp.where(mask_max,max_entropy,jnp.where(mask_min, min_entropy, renyi)))
-    return entropy
-
-
-
+    # Convert inputs to arrays
+    logp = jnp.asarray(logp)  # Shape: (..., vocab_size)
+    alphas = jnp.asarray(alphas)  # Shape: (num_alphas,)
+    assert alphas.ndim == 1, "alphas must be a 1D array"
+    # Handle special cases
+    is_alpha_0 = jnp.isclose(alphas, 0.0)
+    is_alpha_1 = jnp.isclose(alphas, 1.0)
+    
+    # Replace -inf with very negative number to avoid NaN in exp
+    logp = jnp.where(jnp.isneginf(logp), -1e30, logp)
+    
+    # Compute probabilities
+    p = jnp.exp(logp)  # Shape: (..., vocab_size)
+    
+    # For alpha != 1 case: H_alpha = 1/(1-alpha) * log(sum(p^alpha))
+    # Reshape alphas for broadcasting: (..., 1) * (num_alphas,) -> (..., num_alphas)
+    log_p_alpha = jnp.where(
+        p[..., None, :] > 0,  # Only compute for non-zero probabilities
+        logp[..., None, :] * alphas[:, None],  # Shape: (..., num_alphas, vocab_size)
+        -1e30  # Large negative number for zero probabilities
+    )
+    
+    # Compute log sum exp carefully to avoid overflow/underflow
+    max_log_p_alpha = jnp.max(log_p_alpha, axis=-1, keepdims=True)
+    log_p_alpha_shifted = log_p_alpha - max_log_p_alpha
+    log_sum_p_alpha = jnp.log(jnp.sum(jnp.exp(log_p_alpha_shifted), axis=-1)) + max_log_p_alpha[..., 0]
+    
+    # Handle the division by (1-alpha) carefully
+    renyi_alpha = jnp.where(
+        jnp.abs(1.0 - alphas) > 1e-6,  # Avoid division by very small numbers
+        log_sum_p_alpha / (1.0 - alphas),
+        jnp.zeros_like(log_sum_p_alpha)  # Will be replaced by Shannon entropy
+    )
+    
+    # For alpha = 1 case (Shannon entropy)
+    # Only include non-zero probabilities in the sum
+    nonzero_mask = p > 0
+    shannon = -jnp.sum(
+        jnp.where(nonzero_mask, p * logp, 0.0),
+        axis=-1
+    )[..., None]  # Shape: (..., 1)
+    
+    # For alpha = 0 case (log of support size)
+    log_support_size = jnp.log(jnp.sum(p > 0, axis=-1))[..., None]  # Shape: (..., 1)
+    
+    # Combine all cases
+    result = jnp.where(
+        is_alpha_0[None, :],
+        jnp.broadcast_to(log_support_size, log_sum_p_alpha.shape),
+        jnp.where(
+            is_alpha_1[None, :],
+            jnp.broadcast_to(shannon, log_sum_p_alpha.shape),
+            renyi_alpha
+        )
+    )
+    # Handle degenerate cases (all probability mass in one state)
+    is_deterministic = jnp.sum(p > 0, axis=-1) <= 1
+    result = jnp.where(is_deterministic[..., None], 0.0, result)
+    
+    return result  # Shape: (..., num_alphas)
 
 @jax.jit
 def ent_grad_hess(

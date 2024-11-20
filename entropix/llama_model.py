@@ -1,3 +1,7 @@
+
+
+
+
 import jax
 import jax.numpy as jnp
 from typing import Optional, Dict, Union
@@ -100,7 +104,7 @@ def llama_xfmr(
         )
         attn_probs = normalize_logits(attn_logits, noise_floor=ATTN_NOISE_FLOOR)
         attn_ent = renyi_entropy(attn_probs, renyi_params)
-        attn_ent_array = attn_ent_array.at[layer_idx, :, :, :, :].set(attn_ent.squeeze(1)[..., None])
+        attn_ent_array = attn_ent_array.at[layer_idx, :, :, :, :].set(attn_ent)
     h_norm = rms_norm(h, xfmr_weights.final_norm)
     return {
         "h": h_norm,

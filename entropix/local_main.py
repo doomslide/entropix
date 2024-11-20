@@ -12,12 +12,13 @@ from entropix.kvcache import KVCache
 from entropix.llama_model import llama_xfmr
 from entropix.llama_config import MODEL_CONFIGS, create_llama_params
 from entropix.sampler import SamplerConfig, sample
-from entropix.sampler import sample
 from entropix.tokenizer import Tokenizer
 from entropix.llama_weights import load_llama_weights
+from entropix.basic_sample import init_renyi_state, RenyiState, RenyiWeights, basic_sample, DEFAULT_RENYI_WEIGHTS
 
 DEFAULT_WEIGHTS_PATH = Path(__file__).parent / '../weights'
 MAX_SEQ_LEN = 8192
+
 def apply_scaling(freqs: jax.Array):
   SCALE_FACTOR = 8
   LOW_FREQ_FACTOR = 1
@@ -89,6 +90,7 @@ def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('1B-Instruct')):
         kv_heads=xfmr_params.attn_params.n_kv_heads,
         head_dim=xfmr_params.attn_params.head_dim,
     )
+    key = jax.random.PRNGKey(0)  # Initialize a random key
     with mesh: 
       embedded_tokens = xfmr_weights.embedding[tokens]
       xfmr_output = xfmr_fn(
@@ -99,10 +101,11 @@ def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('1B-Instruct')):
           xfmr_params=xfmr_params,
           kvcache=kvcache,
           attn_mask=attn_mask,
-          renyi_params=jnp.array([1.0]),
+          renyi_params=jnp.array([1.0]),  
       ) 
       logits, kvcache = jnp.dot(xfmr_output["h"],xfmr_weights.unembedding), xfmr_output["kv_cache"]
-      next_token = jnp.argmax(logits[:, -1], axis=-1, keepdims=True).astype(jnp.int32)
+      next_token = jax.random.categorical(key, logits[:, -1], axis=-1).astype(jnp.int32)
+    renyi_state = init_renyi_state(tokens, logits, DEFAULT_RENYI_WEIGHTS)
     print(tokenizer.decode([next_token.item()]), end='', flush=True)
     cur_pos = seqlen
     stop = jnp.array([128001, 128008, 128009])
@@ -111,6 +114,7 @@ def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('1B-Instruct')):
     h=xfmr_weights.embedding[next_token]
     while cur_pos < 8192:
       cur_pos += 1
+      key, subkey = jax.random.split(key)  # Split the key for the next iteration
       with mesh: 
         xfmr_output = xfmr_fn(
           h=h,
@@ -121,13 +125,15 @@ def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('1B-Instruct')):
           kvcache=kvcache,
           renyi_params=jnp.array([1.0]),
         )
-        logits = jnp.dot(xfmr_output["h"], xfmr_weights.unembedding)
-        next_token = sample(logits, xfmr_output["attn_ent"], cur_pos, cfg=sampler_cfg)
-        h = xfmr_weights.embedding[next_token]
-        out_token = tokenizer.decode(next_token.tolist()[0])
+        print(f"xfmr_output['h'] shape: {xfmr_output['h'].shape}")
+        logits = jnp.dot(xfmr_output["h"][:, -1, :], xfmr_weights.unembedding)
+        print(f"logits shape: {logits.shape}")
+        next_token, renyi_state = basic_sample(renyi_state, logits, DEFAULT_RENYI_WEIGHTS, subkey)
+        assert next_token.ndim == 1
+        out_token = tokenizer.decode(next_token.tolist())
         print(out_token, end='', flush=True)
         if jnp.isin(next_token, stop).any():
-          break
+            break
 
   prompt = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
