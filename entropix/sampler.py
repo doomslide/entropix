@@ -32,11 +32,11 @@ class SamplerConfig:
   high_scaffold_varentropy_threshold = 0.8
 
 
-@partial(jax.jit, static_argnames=("config",))
+@partial(jax.jit, static_argnames=("cfg",))
 def sample(
   state: DSState,
   logits: jnp.ndarray,
-  config: DSConfig,
+  cfg: DSConfig,
   clarifying_question_token: int = 2564,
   key=jax.random.PRNGKey(1337),
 ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
@@ -51,7 +51,7 @@ def sample(
     scaffold_varent,
     naked_token_logprob,
     scaffold_token_logprob,
-  ) = adaptive_dirichlet_step(key, state, logits, config)
+  ) = adaptive_dirichlet_step(key, state, logits, cfg)
   new_token = new_token.reshape((bsz, 1))
 
   def _and(*args):

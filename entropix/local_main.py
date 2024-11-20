@@ -4,20 +4,20 @@ import math
 from pathlib import Path
 
 import jax
+jax.config.update("jax_disable_jit", True)
 import jax.numpy as jnp
 import tyro
 
-from entropix.config import LLAMA_1B_PARAMS
 from entropix.kvcache import KVCache
-from entropix.model import xfmr
+from entropix.llama_model import llama_xfmr
+from entropix.llama_config import MODEL_CONFIGS, create_llama_params
 from entropix.sampler import SamplerConfig, sample
-from entropix.prompts import create_prompts_from_csv, prompt6, p4o
 from entropix.sampler import sample
 from entropix.tokenizer import Tokenizer
-from entropix.weights import load_weights
+from entropix.llama_weights import load_llama_weights
 
 DEFAULT_WEIGHTS_PATH = Path(__file__).parent / '../weights'
-
+MAX_SEQ_LEN = 8192
 def apply_scaling(freqs: jax.Array):
   SCALE_FACTOR = 8
   LOW_FREQ_FACTOR = 1
@@ -63,37 +63,71 @@ def build_attn_mask(seqlen: int, start_pos: int) -> jax.Array:
 
 def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('1B-Instruct')):
 #def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('70B-Nemotron-Instruct')):
-  model_params = LLAMA_1B_PARAMS
-  xfmr_weights = load_weights(weights_path.absolute(), n_layers=model_params.n_layers)
+  config=MODEL_CONFIGS["1B"]
+  xfmr_params = create_llama_params(config)
+  xfmr_weights, mesh = load_llama_weights(weights_path.absolute(), config)
   tokenizer = Tokenizer('entropix/tokenizer.model')
-  xfmr_fn = jax.jit(xfmr, static_argnames=("model_params",))
+  xfmr_fn = jax.jit(llama_xfmr, static_argnames=("xfmr_params",))
   sample_fn = jax.jit(sample, static_argnames=("cfg",))
 
   # Create the batch of tokens
-  def generate(xfmr_weights, model_params, tokens):
+  def generate(xfmr_weights, xfmr_params, tokens):
     gen_tokens = None
     cur_pos = 0
     tokens = jnp.array([tokens], jnp.int32)
     bsz, seqlen = tokens.shape
-    attn_mask = build_attn_mask(seqlen, cur_pos)
-    freqs_cis = precompute_freqs_cis(model_params.head_dim, model_params.max_seq_len, model_params.rope_theta, model_params.use_scaled_rope)
-    kvcache = KVCache.new(model_params.n_layers, bsz, model_params.max_seq_len, model_params.n_local_kv_heads, model_params.head_dim)
-    logits, kvcache, _, _ = xfmr_fn(xfmr_weights, model_params, tokens, cur_pos, freqs_cis[:seqlen], kvcache, attn_mask=attn_mask)
-    next_token = jnp.argmax(logits[:, -1], axis=-1, keepdims=True).astype(jnp.int32)
+    print(f"prompt length: {seqlen}")
+    attn_mask = build_attn_mask(
+        seqlen=seqlen,
+        start_pos=cur_pos
+    )
+    # initialize kv cache
+    kvcache = KVCache.new(
+        layers=xfmr_params.n_layers,
+        bsz=bsz,
+        max_cache_len=MAX_SEQ_LEN,
+        kv_heads=xfmr_params.attn_params.n_kv_heads,
+        head_dim=xfmr_params.attn_params.head_dim,
+    )
+    with mesh: 
+      embedded_tokens = xfmr_weights.embedding[tokens]
+      xfmr_output = xfmr_fn(
+          h=embedded_tokens,
+          cur_pos=cur_pos,
+          xfmr_weights=xfmr_weights,
+          seqlen=seqlen,
+          xfmr_params=xfmr_params,
+          kvcache=kvcache,
+          attn_mask=attn_mask,
+          renyi_params=jnp.array([1.0]),
+      ) 
+      logits, kvcache = jnp.dot(xfmr_output["h"],xfmr_weights.unembedding), xfmr_output["kv_cache"]
+      next_token = jnp.argmax(logits[:, -1], axis=-1, keepdims=True).astype(jnp.int32)
     print(tokenizer.decode([next_token.item()]), end='', flush=True)
     cur_pos = seqlen
     stop = jnp.array([128001, 128008, 128009])
     sampler_cfg = SamplerConfig()
     gen_tokens = [next_token]
+    h=xfmr_weights.embedding[next_token]
     while cur_pos < 8192:
       cur_pos += 1
-      logits, kvcache, scores, stats = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
-      next_token = sample(logits, scores, cur_pos, cfg=sampler_cfg)
-      gen_tokens.append(next_token)
-      out_token = tokenizer.decode(next_token.tolist()[0])
-      print(out_token, end='', flush=True)
-      if jnp.isin(next_token, stop).any():
-        break
+      with mesh: 
+        xfmr_output = xfmr_fn(
+          h=h,
+          xfmr_weights=xfmr_weights,
+          xfmr_params=xfmr_params,
+          cur_pos=cur_pos,
+          seqlen=1,
+          kvcache=kvcache,
+          renyi_params=jnp.array([1.0]),
+        )
+        logits = jnp.dot(xfmr_output["h"], xfmr_weights.unembedding)
+        next_token = sample(logits, xfmr_output["attn_ent"], cur_pos, cfg=sampler_cfg)
+        h = xfmr_weights.embedding[next_token]
+        out_token = tokenizer.decode(next_token.tolist()[0])
+        print(out_token, end='', flush=True)
+        if jnp.isin(next_token, stop).any():
+          break
 
   prompt = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
@@ -110,7 +144,7 @@ Sort the numbers from highest to lowest: 9.1, 9.8, 9.11, 9.9, 9.12<|eot_id|><|st
   #Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
   print(prompt)
   tokens = tokenizer.encode(prompt,  bos=False, eos=False, allowed_special='all')
-  generate(xfmr_weights, model_params, tokens)
+  generate(xfmr_weights, xfmr_params, tokens)
 
 
 import os
