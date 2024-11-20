@@ -161,11 +161,11 @@ def basic_sample(
 #     cfg: RenyiWeights,
 #     key: jax.random.PRNGKey
 # ) -> Tuple[DecodeState, RenyiState]:
-#   # compute 4 scalars based on state and xfmr_output:
+#   # compute 3 scalars based on state and xfmr_output:
 #     # I: inject score
 #     # B: backtrack score
 #     # T: basic score
-#   # method is picked by argmax over 4 scalars
+#   # method is picked by argmax over 3 scalars
 #   # (injection tactic): return argmax over injection tokens (some finite curated list)
 #   # (backtrack tactic): move cur_pos to max(last_attn_spike, cur_pos -max_backtrack) and update disallowed tokens (i.e. add the token following last attention spike to disallowed and remove all tokens in positions greater than last attention spike)
 #   # (basic score tactic): sample with tuned temperature min_p with params functions of RenyiState (this covers the argmax case)
